@@ -1,0 +1,1615 @@
+---
+title: "Blazar Project 017"
+subtitle: "Fifth Pass_Singlets"
+author: "Michael Zaiken"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    css: tactile.css
+    code_folding: show
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 92
+---
+
+<hr class="rounded">
+
+# Major Questions:
+
+## Sample Groups:
+-   BM Only
+-   aGVHD
+-   Steroid Resistant aGVHD
+-   Steroid Responsive aGVHD
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+### Important Note:
+Text shown in a smaller font is from the Seurat manual. It is meant to give a technical explanation of each step of the analysis but does not itself contain any critical information for the interpretation of this report.
+</div>
+
+```{r Environment_Set_Up, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F}
+source("./scRNAseq_LoadIn.R")
+
+colors = c(rev(brewer.pal(8,"Blues")[5:8]),
+           rev(brewer.pal(8,"Reds")[5:8]),
+           rev(brewer.pal(8,"Greens")[5:8]),
+           rev(brewer.pal(8,"Purples")[5:8]))
+
+samples = c("S1","S2","S3","S4")
+names = c("BMOnly","aGVHD","SterResist","SterResponse")
+
+if (rstudioapi::documentPath()!=paste(RMD_DIR,"/",identifier,".Rmd",sep="")) {
+  rstudioapi::documentSave()
+  
+  file.copy(from = grep(list.files(path=gsub(pattern = paste(identifier,".Rmd",sep=""),replacement = "",x = rstudioapi::documentPath())),
+       pattern='.html', invert=TRUE, value=TRUE),
+       to = RMD_DIR,overwrite = T,recursive = T)
+  
+  print("Files have been copied to new directory. Please reopen from new location")
+  rstudioapi::navigateToFile(paste(RMD_DIR,"/",identifier,".Rmd",sep=""))
+  rstudioapi::navigateToFile(paste(RMD_DIR,"/scRNAseq_LoadIn.R",sep=""))
+  rstudioapi::navigateToFile(paste(RMD_DIR,"/tactile.css",sep=""))
+} else {
+  print("Files are in correct source location, continue operation")
+}
+```
+
+```{r Generate Seurat Object, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+#IMPORTANT NOTE: Do NOT run this section of the Seurat RDS has already been generated!!!
+
+#Data load in and merge
+require('Seurat')
+seurats = list()
+i=1
+for (i in 1:length(samples)) {
+  # Load in the UMI matrix
+  UMI = ReadMtx(mtx = paste(DATA_DIR,"/UMI Matrixes/",samples[[i]],"/matrix.mtx",sep=""),
+                cells = paste(DATA_DIR,"/UMI Matrixes/",samples[[i]],"/barcodes.tsv",sep=""),
+                features = paste(DATA_DIR,"/UMI Matrixes/",samples[[i]],"/features.tsv",sep=""))
+  
+  colnames(UMI)=gsub("\\-1*","",colnames(UMI))
+  
+  # Load in the HTO Matrix generated from CITE-Seq
+    ## For generating a hashtag count matrix from FASTQ files, please refer to
+    ## https://github.com/Hoohm/CITE-seq-Count.  Load in the HTO count matrix
+  HTO = ReadMtx(mtx = paste(DATA_DIR,"/HTO Matrixes/",samples[[i]],"/matrix.mtx",sep=""),
+                cells = paste(DATA_DIR,"/HTO Matrixes/",samples[[i]],"/barcodes.tsv",sep=""),
+                features = paste(DATA_DIR,"/HTO Matrixes/",samples[[i]],"/features.tsv",sep=""),
+                feature.column = 1)
+  # Select cell barcodes detected by both RNA and HTO
+    ## As CITE-Seq uses a barcode whitelist from CellRanger, there should be VERY few dropped barcodes
+  joint.bcs <- intersect(colnames(UMI), colnames(HTO))
+
+  # Subset RNA and HTO counts by joint cell barcodes
+  UMI <- UMI[, joint.bcs]
+  HTO <- as.matrix(HTO[, joint.bcs])
+
+  # Confirm that the HTO have the correct names
+  rownames(HTO) = c(rep(paste(names[[i]],"_R",1:length(names),sep = ""),),"unmapped")
+  
+  # Setup Seurat object
+  pbmc.hashtag <- CreateSeuratObject(counts = UMI)
+
+  # Normalize RNA data with log normalization
+  pbmc.hashtag <- NormalizeData(pbmc.hashtag)
+  
+  # Find and scale variable features
+  pbmc.hashtag <- FindVariableFeatures(pbmc.hashtag, selection.method = "mean.var.plot")
+  pbmc.hashtag <- ScaleData(pbmc.hashtag, features = VariableFeatures(pbmc.hashtag))
+  
+  ## Adding HTO data as an independent assay
+  
+  # Add HTO data as a new assay independent from RNA
+  pbmc.hashtag[["HTO"]] <- CreateAssayObject(counts = HTO)
+  # Normalize HTO data, here we use centered log-ratio (CLR) transformation
+  pbmc.hashtag <- NormalizeData(pbmc.hashtag, assay = "HTO", normalization.method = "CLR")
+  
+  ## Demultiplex cells based on HTO enrichment
+  pbmc.hashtag <- HTODemux(pbmc.hashtag, assay = "HTO", positive.quantile = 0.99, init = 5, verbose = T)
+  
+  seurats[[i]] = pbmc.hashtag
+  names(seurats)[[i]] = samples[[i]]
+}
+
+pbmc.big = merge(seurats[[1]],y=c(seurats[[2]],seurats[[3]],seurats[[4]]),add.cell.ids=names,project=identifier)
+saveRDS(pbmc.big,file = paste(paste(PROG_DIR,"/PBMC_BIG.RDS",sep="")))
+```
+
+<hr class="solid">
+
+# Demultiplexing of Samples
+
+Samples came in the form of 4 sequencing samples, with 4 multiplexed replicates per sample. Prior to analysis, replicates must be demultiplexed from samples, and filtered for doublet cells. Doublets arise as a result of multiple hashtags being associated with a given cell. This most likely happens by overloading the 10X wells in order to capture multiplexed samples and is expected.
+
+Because each sequencing sample contains 4 biological replicates **from the same treatment condition** it is actually possible to include doublets in the analysis provided that they can be correctly mapped back to the correct group. 
+
+In this report **all doublet cells have been removed**. However bear in mind that they can be added back in if we so choose.  
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+Developed in collaboration with the Technology Innovation Group at NYGC, Cell Hashing uses oligo-tagged antibodies against ubiquitously expressed surface proteins to place a “sample barcode” on each single cell, enabling different samples to be multiplexed together and run in a single experiment. For more information, please refer to this paper.
+
+Output from running HTODemux() is saved in the object metadata. We can visualize how many cells are classified as singlets, doublets and negative/ambiguous cells.
+
+The demultiplexing function HTODemux() implements the following procedure:
+-   We perform a k-medoid clustering on the normalized HTO values, which initially separates cells into K(# of samples)+1 clusters.
+-   We calculate a ‘negative’ distribution for HTO. For each HTO, we use the cluster with the lowest average value as the negative group.
+-   For each HTO, we fit a negative binomial distribution to the negative cluster. We use the 0.99 quantile of this distribution as a threshold.
+-   Based on these thresholds, each cell is classified as positive or negative for each HTO.
+-   Cells that are positive for more than one HTOs are annotated as doublets.
+</font>
+</div>
+
+
+```{r DeMultiplexing, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+pbmc = readRDS((paste(DATA_DIR,"/Seurat/PBMC_BIG.RDS",sep="")))
+
+samples = c("S1","S2","S3","S4")
+names = c("BMOnly","aGVHD","SterResist","SterResponse")
+
+#Visualize enrichment for selected HTOs with ridge plots
+# Group cells based on the max HTO signal
+
+for (i in 1:length(names)) {
+  png(filename = paste(RES_DIR,"/DeMulti","/RidgePlot_",names[[i]],".png",sep=""),width = 16,height = 4,units = "in",res = 600)
+    print(RidgePlot(pbmc, assay = "HTO", 
+          features = grep(paste(names[[i]]),rownames(pbmc@assays$HTO),value = T),
+          ncol = 4,
+          idents = grep(paste(names[[i]]),rownames(pbmc@assays$HTO),value = T),
+          cols = colors[c(1:4)+((i-1)*4)]))
+  dev.off()
+}
+
+#Compare number of UMIs for singlets, doublets and negative cells
+Idents(pbmc) <- "HTO_classification.global"
+
+png(filename = paste(RES_DIR,"/DeMulti/DoubletCounts",".png",sep=""),width = 8,height = 6,units = "in",res = 600)
+  VlnPlot(pbmc, features = "nCount_RNA", pt.size = 0.1, log = TRUE)
+dev.off()
+
+pbmc_positive <- subset(pbmc, idents = "Negative", invert = TRUE)
+
+# Calculate a tSNE embedding of the HTO data
+DefaultAssay(pbmc_positive) <- "HTO"
+pbmc_positive <- ScaleData(pbmc_positive, features = rownames(pbmc_positive),
+    verbose = FALSE)
+pbmc_positive <- RunPCA(pbmc_positive, features = rownames(pbmc_positive), approx = FALSE,npcs = 17)
+
+pbmc_positive <- RunTSNE(pbmc_positive, dims = 1:17, perplexity = 100,check_duplicates=FALSE)
+
+Idents(pbmc) <- "HTO_classification.global"
+png(filename = paste(RES_DIR,"/DeMulti/DoubletMapping_Global",".png",sep=""),width = 8,height = 6,units = "in",res = 600)
+  DimPlot(pbmc_positive)
+dev.off()
+
+Idents(pbmc_positive) =  'HTO_classification'
+png(filename = paste(RES_DIR,"/DeMulti/DoubletMapping_BySample",".png",sep=""),width = 16,height = 8,units = "in",res = 600)
+  DimPlot(pbmc_positive)+theme(legend.title=element_text(size=10),legend.text=element_text(size=7))
+dev.off()
+
+#Create an HTO heatmap, based on Figure 1C in the Cell Hashing paper.
+# To increase the efficiency of plotting, you can subsample cells using the num.cells argument
+HTOHeatmap(pbmc, assay = "HTO", ncells = 5000)
+
+#Cluster and visualize cells using the usual scRNA-seq workflow, and examine for the potential presence of batch effects.
+# Extract the singlets
+pbmc.singlet <- subset(pbmc, idents = "Singlet")
+
+# Select the top 1000 most variable features
+pbmc.singlet <- FindVariableFeatures(pbmc.singlet, selection.method = "mean.var.plot")
+
+# Scaling RNA data, we only scale the variable features here for efficiency
+pbmc.singlet <- ScaleData(pbmc.singlet, features = VariableFeatures(pbmc.singlet))
+
+# Run PCA
+pbmc.singlet <- RunPCA(pbmc.singlet, features = VariableFeatures(pbmc.singlet))
+# We select the top 10 PCs for clustering and tSNE based on PCElbowPlot
+pbmc.singlet <- FindNeighbors(pbmc.singlet, reduction = "pca", dims = 1:10)
+pbmc.singlet <- FindClusters(pbmc.singlet, resolution = 0.6, verbose = FALSE)
+pbmc.singlet <- RunTSNE(pbmc.singlet, reduction = "pca", dims = 1:10)
+
+pbmc.singlet.orig = pbmc.singlet
+
+
+
+pbmc.singlet$HTO_classification = factor(x = pbmc.singlet$HTO_classification,levels = levels(factor(pbmc.singlet$HTO_classification))[c(5:8,1:4,9:17)])
+
+
+# Projecting singlet identities on TSNE visualization
+
+png(filename = paste(RES_DIR,"/DeMulti/Singlet_IDs",".png",sep=""),width = 8,height = 6,units = "in",res = 600)
+  DimPlot(pbmc.singlet, group.by = "HTO_classification",pt.size = 0.75,
+          cols = c(colors,"grey"))
+dev.off()
+
+saveRDS(pbmc.singlet,file = paste(paste(PROG_DIR,"/PBMC_Singlets.RDS",sep="")))
+
+```
+
+In the following Ridge Plots each replicate in a sample is checked for the expression of hash tags unique to other replicates. This allows us to visually demonstrate that each replicate has been successfully separated from the others in its sample. Unmapped cells did not have an associated hashtag, and are later discarded from the analysis. 
+
+```{r DeMultiplexing Results 1, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+slickR(list.files(path = paste(RES_DIR,"/DeMulti/",sep=""),pattern = "RidgePlot_",full.names = T)[c(2,1,3,4)],height = 300)
+pbmc = readRDS((paste(DATA_DIR,"/Seurat/PBMC_BIG.RDS",sep="")))
+```
+
+After all samples have been succsessfully seperated, they are merged into a single data object, allowing us to quantify how many cells are evaluable for further analysis. These are divided out as Negative cells which lack a hashtag, doublets which contain multiple hashtags, and singlets which have only a single hashtag. In this case after merging the breakdown is:
+
+-   Negative Cells: `r table(pbmc$HTO_classification.global)[[2]]`
+-   Doublet Cells: `r table(pbmc$HTO_classification.global)[[1]]`
+-   Singlet Cells: `r table(pbmc$HTO_classification.global)[[3]]`
+
+```{r DeMultiplexing Results 2, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeMulti/DoubletCounts",".png",sep=""))
+```
+
+We can further map out the singlets and demonstrate that while doublets are present in the data, because the replicates for each condition are pooled into a single sample rather than divided across samples, they still cluster with the appropriate singlets within a tSNE space.
+
+```{r DeMultiplexing Results 3, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeMulti/DoubletMapping_BySample",".png",sep=""))
+```
+
+Finally we can seperate out the singlets from the doublets, finalizing our data structure for deeper analysis. Once more note how the replicates of each sample co-cluster into defined regions with the t-SNE plot. 
+
+```{r DeMultiplexing Results 4, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeMulti/Singlet_IDs",".png",sep=""))
+```
+
+<hr class="solid">
+
+# QC and Cell Selection
+
+Now that the data is structured correctly, and only singlet cells remain in the analysis, we first need to filter out remaining cells that are likely of low quality. We do this by analyzing a number of quality control metrics including: the number of identified features (genes) per cell, the number of counts (reads) that mapped to each cell, and the percentage of those reads that are derived from mitochondrial DNA. 
+
+Excess features or genes mapped to a cell is indicative of a doublet or multiplet that got through initial screening. Similarly excessive mitochondrial reads indicates either free mitochondria contaminating the sample, or cells that are dying. 
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Seurat allows you to easily explore QC metrics and filter cells based
+on any user-defined criteria. A few QC metrics commonly used by the
+community include:*
+
+-   *The number of unique genes detected in each cell.*
+-   *Low-quality cells or empty droplets will often have very few genes*
+-   *Cell doublets or multiplets may exhibit an aberrantly high gene
+    count*
+-   *Similarly, the total number of molecules detected within a cell
+    (correlates strongly with unique genes)*
+-   *The percentage of reads that map to the mitochondrial genome*
+-   *Low-quality / dying cells often exhibit extensive mitochondrial
+    contamination*
+
+*We calculate mitochondrial QC metrics with the PercentageFeatureSet()
+function, which calculates the percentage of counts originating from a
+set of features - We use the set of all genes starting with MT- as a set
+of mitochondrial genes*
+</font>
+</div>
+
+### Feature Comparisons prior to data subsetting
+
+```{r QC and Cell Selection Pre, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+gc()
+pbmc = readRDS(paste(PROG_DIR,"/PBMC_Singlets.RDS",sep=""))
+
+pbmc <- subset(pbmc, subset = HTO_classification.global=="Singlet")
+pbmc <- subset(pbmc, subset = HTO_classification!="unmapped")
+
+Idents(pbmc) =  'HTO_maxID'
+
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^mt-")
+pbmc[["seq_sample"]] = gsub("-R[1-4]","",pbmc@meta.data$HTO_maxID)
+pbmc[["rep_sample"]] = gsub("S[1-4]-","",pbmc@meta.data$HTO_maxID)
+
+# Visualize QC metrics as a violin plot
+plot1 = VlnPlot(pbmc, features = c("nFeature_RNA"),pt.size = 0.25,cols = c(colors))+
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=8),
+        legend.position = "none")
+plot2 = VlnPlot(pbmc, features = c("nCount_RNA"),pt.size = 0.25,cols = colors)+
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=8),
+        legend.position = "none")
+plot3 = VlnPlot(pbmc, features = c("percent.mt"),pt.size = 0.25,cols = colors)+
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=8),
+        legend.position = "none")
+
+png(filename = paste(RES_DIR,"/QC_Plots","/QC_metrics_pre-subset.png",sep = ""),width = 12,height = 6,units = "in",res = 600)
+  multiplot(plot1,plot2,plot3,cols = 3)
+dev.off()
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt",cols = colors)+
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=8),
+        legend.position = "right")
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",cols = colors)+
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=8),
+        legend.position = "right")
+png(filename = paste(RES_DIR,"/QC_Plots","/Metric_compare_pre-subset.png",sep = ""),width = 12,height = 6,units = "in",res = 600)
+  multiplot(plot1,plot2,cols=2)
+dev.off()
+
+```
+
+```{r QC and Cell Selection Plot Pre, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+nfeature_thresh_min = 100
+nfeature_thresh_max = 4000
+ncount_thresh_max = 9000
+percent.mt_thresh = 5
+
+knitr::include_graphics(paste(RES_DIR,"/QC_Plots","/QC_metrics_pre-subset.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/QC_Plots","/Metric_compare_pre-subset.png",sep=""))
+```
+
+Based on the plots above the following cutoffs were used for data
+subsetting based on QC:
+
+-   nFeature_RNA = \>`r nfeature_thresh_min` & \<`r nfeature_thresh_max`
+-   percent.mt = `r percent.mt_thresh`
+-   nCount_RNA = \<`r ncount_thresh_max` 
+-   Multiplexing doublets and negatives are also removed
+
+### Feature Comparisons post data subsetting
+
+```{r QC and Cell Selection Post, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+
+pbmc <- subset(pbmc, subset = nFeature_RNA > nfeature_thresh_min & 
+                 nFeature_RNA < nfeature_thresh_max & 
+                 percent.mt < percent.mt_thresh & 
+                 nCount_RNA < ncount_thresh_max)
+
+# Visualize QC metrics as a violin plot
+plot1 = VlnPlot(pbmc, features = c("nFeature_RNA"),pt.size = 0.25,cols = colors)+
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=8),
+        legend.position = "none")
+plot2 = VlnPlot(pbmc, features = c("nCount_RNA"),pt.size = 0.25,cols = colors)+
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=8),
+        legend.position = "none")
+plot3 = VlnPlot(pbmc, features = c("percent.mt"),pt.size = 0.25,cols = colors)+
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=8),
+        legend.position = "none")
+
+png(filename = paste(RES_DIR,"/QC_Plots","/QC_metrics_post-subset.png",sep = ""),width = 12,height = 6,units = "in",res = 600)
+  multiplot(plot1,plot2,plot3,cols = 3)
+dev.off()
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt",cols = colors)+
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=8),
+        legend.position = "right")
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA",cols = colors)+
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=8),
+        legend.position = "right")
+png(filename = paste(RES_DIR,"/QC_Plots","/Metric_compare_post-subset.png",sep = ""),width = 12,height = 6,units = "in",res = 600)
+  multiplot(plot1,plot2,cols=2)
+dev.off()
+```
+
+```{r QC and Cell Selection Plot 3, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/QC_Plots","/QC_metrics_post-subset.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/QC_Plots","/Metric_compare_post-subset.png",sep=""))
+
+#pbmc = readRDS(paste(PROG_DIR,"/PBMC_current.RDS",sep=""))
+```
+
+<hr class="solid">
+
+# Normalizing the data
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*After removing unwanted cells from the dataset, the next step is to
+normalize the data. By default, we employ a global-scaling normalization
+method "LogNormalize" that normalizes the feature expression
+measurements for each cell by the total expression, multiplies this by a
+scale factor (10,000 by default), and log-transforms the result.
+Normalized values are stored in pbmc[["RNA"]]@data.*
+</font>
+</div>
+
+```{r Data Normalization, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=F}
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+## Identification of highly variable features (feature selection)
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*We next calculate a subset of features that exhibit high cell-to-cell
+variation in the dataset (i.e, they are highly expressed in some cells,
+and lowly expressed in others). Focusing on these genes in downstream
+analysis helps to highlight biological signal in single-cell datasets.*
+
+*The procedure in Seurat is described in detail here, and improves on
+previous versions by directly modeling the mean-variance relationship
+inherent in single-cell data, and is implemented in the
+FindVariableFeatures() function. By default, we return 2,000 features
+per dataset. These will be used in downstream analysis, like PCA.*
+</font>
+</div>
+
+```{r Feature Selection, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+pbmc <- FindVariableFeatures(pbmc, selection.method = "vst", nfeatures = 5000)
+
+# Identify the 10 most highly variable genes
+top25 <- head(VariableFeatures(pbmc), 25)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)+theme(legend.position = c(0.05,0.75),
+                                         legend.title = element_text(size = 10),
+                                         legend.text = element_text(size = 10))
+plot2 <- LabelPoints(plot = plot1, points = top25, repel = TRUE)
+
+
+png(filename = paste(RES_DIR,"/QC_Plots","/Feature_Selection.png",sep = ""),width = 12,height = 4,units = "in",res = 600)
+  plot1+plot2
+dev.off()
+```
+
+```{r Feature Selection Plots, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/QC_Plots","/Feature_Selection.png",sep=""))
+```
+
+<hr class="solid">
+
+## Scaling the data
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Next, we apply a linear transformation ('scaling') that is a standard
+pre-processing step prior to dimensional reduction techniques like PCA.
+The ScaleData() function:*
+
+-   *Shifts the expression of each gene, so that the mean expression
+    across cells is 0*
+-   *Scales the expression of each gene, so that the variance across
+    cells is 1*
+-   *This step gives equal weight in downstream analyses, so that
+    highly-expressed genes do not dominate*
+-   *The results of this are stored in pbmc[["RNA"]]@scale.data*
+</font>
+</div>
+
+```{r Data Scaling, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=F}
+tic()
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes)
+toc()
+```
+
+------------------------------------------------------------------------
+
+# Linear dimensional reduction
+
+At the core of scRNAseq analysis is the process of dimensional reduction. In traditional large data analysis we use principal components to define axes of variation within a dataset and then visualize the data by plotting it within a space defined by the most variable PCs. This is insufficent for single cell RNAseq as the number of axes of variation will be in the tens of thousands. As such following the calculation of principle components, we must perform dimmensional reduction to scale the data to a visualizabile state.
+
+We begin by performing traditional PCA.
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Next we perform PCA on the scaled data. By default, only the previously
+determined variable features are used as input, but can be defined using
+features argument if you wish to choose a different subset.*
+</font>
+</div>
+
+```{r Dimmensional Reduction, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+pbmc <- RunPCA(pbmc, features = VariableFeatures(object = pbmc),npcs = 50)
+
+print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
+
+png(filename = paste(RES_DIR,"/Dim_scaling","/seq_plotting.png",sep = ""),width = 12,height = 6,units = "in",res = 600)
+  DimPlot(pbmc,reduction = 'pca', group.by = 'seq_sample', split.by = 'seq_sample',order = rev(names),cols = colors[c(1,5,9,13)])
+dev.off()
+
+png(filename = paste(RES_DIR,"/Dim_scaling","/PC1+PC2_loadings.png",sep = ""),width = 12,height = 6,units = "in",res = 600)
+  VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+dev.off()
+
+png(filename = paste(RES_DIR,"/Dim_scaling","/PCA_Plot.png",sep = ""),width = 6,height = 6,units = "in",res = 600)
+  DimPlot(pbmc, reduction = "pca",cols = colors,pt.size = 0.75)
+dev.off()
+
+png(filename = paste(RES_DIR,"/Dim_scaling","/Dim_Heatmap.png",sep = ""),width = 12,height = 12,units = "in",res = 600)
+  DimHeatmap(pbmc, dims = 1:15, cells = 500, balanced = TRUE)
+dev.off()
+
+```
+
+```{r Dimmensional Reduction Plots 1, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/PCA_Plot.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/PC1+PC2_loadings.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/Dim_Heatmap.png",sep=""))
+```
+
+In addition to the PCA plot itself, we can also define the genes that most contribute to the variation in the higher principle components. We do this first in the loadings plot, to easily discerne the genes that are defining the PCA plot itself, and second through the heatmaps which allow us to look at more components in a denser format. 
+
+With the principle components defined we can also take a look at the distribution of the cells from each sample within principle component space. 
+
+```{r Dimmensional Reduction Plots 2, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/seq_plotting.png",sep=""))
+```
+
+#### Important Note:
+
+If the biological replicates had been divided across sequencing samples, this step would allow us to check for batch effects between the samples. However because the biological replicates are grouped together we cannot make this check, as any potential batch effects would be subsumed into the differences defined by the biological condition. At this stage we have already corrected as much as possible for these effects, but because of this experimental design we cannot confirm that they have been removed. 
+
+# Determine the 'dimensionality' of the dataset
+
+With the principle components now defined, we can choose how many to include in the final dimmensional reduction. There are multiple ways to do this, but all of them serve to score the components based on their impact on the data set. The upper Jack Straw Score Plot does this statistically by calculating a p-value for the signifigance of each component. The Elbow Plot does this graphically based upon the Standard Deviation. In either case we can use these plots to judge how many components to carry forward. 
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*To overcome the extensive technical noise in any single feature for
+scRNA-seq data, Seurat clusters cells based on their PCA scores, with
+each PC essentially representing a 'metafeature' that combines
+information across a correlated feature set. The top principal
+components therefore represent a robust compression of the dataset.
+However, how many components should we choose to include? 10? 20? 100?*
+
+*In Macosko et al, they implemented a resampling test inspired by the
+JackStraw procedure. We randomly permute a subset of the data (1% by
+default) and rerun PCA, constructing a 'null distribution' of feature
+scores, and repeat this procedure. We identify 'significant' PCs as
+those who have a strong enrichment of low p-value features.*
+</font>
+</div>
+
+```{r Dimmensionallity Determination, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+# NOTE: This process can take a long time for big datasets, comment out for expediency. More
+# approximate techniques such as those implemented in ElbowPlot() can be used to reduce
+# computation time
+tic()
+pbmc <- JackStraw(pbmc, num.replicate = 100,dims = 50)
+pbmc <- ScoreJackStraw(pbmc, dims = 1:50)
+toc()
+
+png(filename = paste(RES_DIR,"/Dim_scaling","/JackStraw.png",sep = ""),width = 8,height = 6,units = "in",res = 600)
+  JackStrawPlot(pbmc, dims = 1:50)+theme(legend.title = element_text( size=10), legend.text=element_text(size=8))
+dev.off()
+
+png(filename = paste(RES_DIR,"/Dim_scaling","/ElbowPlot.png",sep = ""),width = 6,height = 6,units = "in",res = 600)
+  ElbowPlot(pbmc, ndims = 50)
+dev.off()
+```
+
+```{r Dimmensionallity plots, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/JackStraw.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/ElbowPlot.png",sep=""))
+```
+
+Based on the above plots, I chose to proceed with 35 dimmensions for further analysis.
+
+<hr class="solid">
+
+# Cluster the cells
+
+With the dimmensionallity of the dataset determined we can cluster the cells and use a non-linear dimensional reduction (in this case UMAP) to define a space by which the cell clusters can be plotted and investifated. 
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Seurat v3 applies a graph-based clustering approach, building upon
+initial strategies in (Macosko et al). Importantly, the distance metric
+which drives the clustering analysis (based on previously identified
+PCs) remains the same. However, our approach to partitioning the
+cellular distance matrix into clusters has dramatically improved. Our
+approach was heavily inspired by recent manuscripts which applied
+graph-based clustering approaches to scRNA-seq data [SNN-Cliq, Xu and
+Su, Bioinformatics, 2015] and CyTOF data [PhenoGraph, Levine et al.,
+Cell, 2015]. Briefly, these methods embed cells in a graph structure -
+for example a K-nearest neighbor (KNN) graph, with edges drawn between
+cells with similar feature expression patterns, and then attempt to
+partition this graph into highly interconnected 'quasi-cliques' or
+'communities'.*
+
+*As in PhenoGraph, we first construct a KNN graph based on the euclidean
+distance in PCA space, and refine the edge weights between any two cells
+based on the shared overlap in their local neighborhoods (Jaccard
+similarity). This step is performed using the FindNeighbors() function,
+and takes as input the previously defined dimensionality of the dataset
+(first 10 PCs).*
+
+*To cluster the cells, we next apply modularity optimization techniques
+such as the Louvain algorithm (default) or SLM [SLM, Blondel et al.,
+Journal of Statistical Mechanics], to iteratively group cells together,
+with the goal of optimizing the standard modularity function. The
+FindClusters() function implements this procedure, and contains a
+resolution parameter that sets the 'granularity' of the downstream
+clustering, with increased values leading to a greater number of
+clusters. We find that setting this parameter between 0.4-1.2 typically
+returns good results for single-cell datasets of around 3K cells.
+Optimal resolution often increases for larger datasets. The clusters can
+be found using the Idents() function.*
+</font>
+</div>
+
+```{r Cell Clustering, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+pbmc <- FindNeighbors(pbmc, dims = 1:35)
+pbmc <- FindClusters(pbmc, resolution = 4)
+
+# Look at cluster IDs of the first 5 cells
+head(Idents(pbmc), 5)
+
+```
+
+## Run non-linear dimensional reduction (UMAP/tSNE)
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Seurat offers several non-linear dimensional reduction techniques, such
+as tSNE and UMAP, to visualize and explore these datasets. The goal of
+these algorithms is to learn the underlying manifold of the data in
+order to place similar cells together in low-dimensional space. Cells
+within the graph-based clusters determined above should co-localize on
+these dimension reduction plots. As input to the UMAP and tSNE, we
+suggest using the same PCs as input to the clustering analysis.*
+</font>
+</div>
+
+```{r UMAP, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+# If you haven't installed UMAP, you can do so via reticulate::py_install(packages =
+# 'umap-learn')
+pbmc <- RunUMAP(pbmc, dims = 1:35)
+
+# note that you can set `label = TRUE` or use the LabelClusters function to help label
+# individual clusters
+
+png(filename = paste(RES_DIR,"/UMAP","/UMAP_Unlabeled.png",sep=""),width = 6,height = 6,units = "in",res = 600)
+  DimPlot(pbmc, reduction = "umap",label = T)
+dev.off()
+#saveRDS(pbmc, file = paste(PROG_DIR,"/PBMC_postUMAP.RDS",sep=""))
+```
+
+```{r UMAP Plot, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/UMAP","/UMAP_Unlabeled.png",sep=""))
+```
+
+<hr class="solid">
+
+<hr class="solid">
+
+# Finding differentially expressed features (cluster biomarkers)
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Seurat can help you find markers that define clusters via differential
+expression. By default, it identifies positive and negative markers of a
+single cluster (specified in ident.1), compared to all other cells.
+FindAllMarkers() automates this process for all clusters, but you can
+also test groups of clusters vs. each other, or against all cells.*
+
+*The min.pct argument requires a feature to be detected at a minimum
+percentage in either of the two groups of cells, and the thresh.test
+argument requires a feature to be differentially expressed (on average)
+by some amount between the two groups. You can set both of these to 0,
+but with a dramatic increase in time - since this will test a large
+number of features that are unlikely to be highly discriminatory. As
+another option to speed up these computations, max.cells.per.ident can
+be set. This will downsample each identity class to have no more cells
+than whatever this is set to. While there is generally going to be a
+loss in power, the speed increases can be significant and the most
+highly differentially expressed features will likely still rise to the
+top.*
+</font>
+</div>
+
+```{r Find Biomarkers, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+require('dplyr')
+
+#pbmc = readRDS(file = paste(PROG_DIR,"/PBMC_postUMAP.RDS",sep=""))
+
+pbmc.markers <- FindAllMarkers(pbmc, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+cluster_markers = as.data.frame(pbmc.markers %>% 
+                                  group_by(cluster) %>% 
+                                  slice_max(n = 2, order_by = avg_log2FC))
+
+i=1
+for (i in 1:length(cluster_markers$gene)) {
+  feature = cluster_markers$gene[[i]]
+  png(filename = paste(RES_DIR,"/BioMarkers/TopMarkers/",feature,".png",sep=""),width = 6,height = 6,units = "in",res = 600)
+    print(FeaturePlot(pbmc,features = feature))
+  dev.off()
+}
+
+pbmc.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+
+png(filename = paste(RES_DIR,"/BioMarkers/DO_HeatMap.png",sep=""),width = 12,height = 20,units = "in",res = 600)
+  DoHeatmap(pbmc, features = top10$gene)
+dev.off()
+
+pbmc.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC) -> top5
+
+top5 = as.data.frame(top5)
+
+i=0
+for (i in 0:(length(unique(top5$cluster))-1)) {
+  png(filename = paste(RES_DIR,"/BioMarkers/ClusterMarkers/","Cluster_",i,".png",sep=""),width = 12,height = 3,units = "in",res = 600)
+  print(FeaturePlot(pbmc,features = top5$gene[top5$cluster==i],
+                    label = T, 
+                    ncol = 5, 
+                    keep.scale = "all")+
+          plot_annotation(paste("Cluster",i,sep=" "),
+                          theme = theme(plot.title = element_text(size = 18,face = "bold")))
+        )
+  dev.off()
+}
+
+#new.cluster.ids <- c("Effector B Cells","CD8+ Cytotoxic T Cells","T Cells_TBD","Apoptotic Cells_TBD","Mature B Cells","Dendritic Cells","Th2 Cells","Macrophages","TReg_TBD","NK Cells","Basophils","Plasmacytoid DCs","Granulocytes")
+#names(new.cluster.ids) <- levels(pbmc)
+#pbmc <- RenameIdents(pbmc, new.cluster.ids)
+
+#png(filename = paste(RES_DIR,"/UMAP/UMAP_Labeled.png",sep=""),width = 8,height = 8,units = "in",res = 600)
+#  DimPlot(pbmc, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+#dev.off()
+```
+
+```{r Find Biomarkers Plots, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/BioMarkers","/DO_HeatMap.png",sep=""))
+slickR(obj = list.files(paste(RES_DIR,"/BioMarkers/ClusterMarkers/",sep = ""), full.names = TRUE) ,height = 200, width = "95%")
+```
+
+# Cell Identification using ScType
+
+Article: [<https://doi.org/10.1038/s41467-022-28803-w>]
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*ScType a computational method for automated selection of marker genes
+based merely on scRNA-seq data. The open-source portal
+(<http://sctype.app>) provides an interactive web-implementation of the
+method.*
+</font>
+</div>
+
+```{r ScType, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+tissue = "Immune system" # e.g. Immune system, Liver, Pancreas, Kidney, Eye, Brain
+
+# prepare gene sets
+gs_list = gene_sets_prepare(db_, tissue)
+
+# get cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = pbmc[["RNA"]]@scale.data, 
+                      scaled = TRUE, 
+                      gs = gs_list$gs_positive, 
+                      gs2 = gs_list$gs_negative) 
+
+# NOTE: scRNAseqData parameter should correspond to your input scRNA-seq matrix. 
+# In case Seurat is used, it is either pbmc[["RNA"]]@scale.data (default), pbmc[["SCT"]]@scale.data, in case sctransform is used for normalization,
+# or pbmc[["integrated"]]@scale.data, in case a joint analysis of multiple single-cell datasets is performed.
+
+# merge by cluster
+cL_resutls = do.call("rbind", lapply(unique(pbmc@meta.data$seurat_clusters), function(cl){
+    es.max.cl = sort(rowSums(es.max[ ,rownames(pbmc@meta.data[pbmc@meta.data$seurat_clusters==cl, ])]), decreasing = !0)
+    head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(pbmc@meta.data$seurat_clusters==cl)), 10)
+}))
+
+sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)  
+
+# set low-confident (low ScType score) clusters to "unknown"
+sctype_scores$type[as.numeric(as.character(sctype_scores$scores)) < sctype_scores$ncells/6] = "Unknown"
+print(sctype_scores[,1:3])
+
+cluster_ids = sctype_scores[order(sctype_scores$cluster),1:3]
+
+pbmc@meta.data$customclassif = ""
+
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  pbmc@meta.data$customclassif[pbmc@meta.data$seurat_clusters == j] = as.character(cl_type$type[1])
+}
+
+# prepare edges
+cL_resutls=cL_resutls[order(cL_resutls$cluster),]; edges = cL_resutls; edges$type = paste0(edges$type,"_",edges$cluster); edges$cluster = paste0("cluster ", edges$cluster); edges = edges[,c("cluster", "type")]; colnames(edges) = c("from", "to"); rownames(edges) <- NULL
+
+# prepare nodes
+nodes_lvl1 = sctype_scores[,c("cluster", "ncells")]; nodes_lvl1$cluster = paste0("cluster ", nodes_lvl1$cluster); nodes_lvl1$Colour = "#f1f1ef"; nodes_lvl1$ord = 1; nodes_lvl1$realname = nodes_lvl1$cluster; nodes_lvl1 = as.data.frame(nodes_lvl1); nodes_lvl2 = c(); 
+
+ccolss = colorRampPalette(brewer.pal(8,"Set1"))(nrow(nodes_lvl1))
+
+#ccolss= c("#5f75ae","#92bbb8","#64a841","#e5486e","#de8e06","#eccf5a","#b5aa0f","#e4b680","#7ba39d","#b15928","#ffff99", "#6a3d9a","#cab2d6","#ff7f00","#fdbf6f","#e31a1c","#fb9a99","#33a02c","#b2df8a","#1f78b4","#a6cee3")
+for (i in 1:length(unique(cL_resutls$cluster))){
+  dt_tmp = cL_resutls[cL_resutls$cluster == unique(cL_resutls$cluster)[i], ]; nodes_lvl2 = rbind(nodes_lvl2, data.frame(cluster = paste0(dt_tmp$type,"_",dt_tmp$cluster), ncells = dt_tmp$scores, Colour = ccolss[i], ord = 2, realname = dt_tmp$type))
+}
+nodes = rbind(nodes_lvl1, nodes_lvl2); nodes$ncells[nodes$ncells<1] = 1;
+files_db = openxlsx::read.xlsx(db_)[,c("cellName","shortName")]; files_db = unique(files_db); nodes = merge(nodes, files_db, all.x = T, all.y = F, by.x = "realname", by.y = "cellName", sort = F)
+nodes$shortName[is.na(nodes$shortName)] = nodes$realname[is.na(nodes$shortName)]; nodes = nodes[,c("cluster", "ncells", "Colour", "ord", "shortName", "realname")]
+
+mygraph <- graph_from_data_frame(edges, vertices=nodes)
+
+# Make the graph
+gggr<- ggraph(mygraph, layout = 'circlepack', weight=I(ncells)) + 
+  geom_node_circle(aes(filter=ord==1,fill=I("#F5F5F5"), colour=I("#D3D3D3")), alpha=0.9) +
+  geom_node_circle(aes(filter=ord==2,fill=I(Colour), colour=I("#D3D3D3")), alpha=0.9) +
+  theme_void() + 
+  geom_node_text(aes(filter=ord==2, label=shortName, colour=I("#ffffff"), fill="white", repel = !1, parse = T, size = I(log(ncells,25)*1.5))) + 
+  geom_node_label(aes(filter=ord==1,  label=shortName, colour=I("#000000"), size = I(3), fill="white", parse = T), repel = !0, segment.linetype="dotted")
+  
+png(filename = paste(RES_DIR,"/ClusterIDs/ClusterMakeUp.png",sep = ""),width = 12,height = 6,units = "in",res = 600)
+  scater::multiplot(DimPlot(pbmc, reduction = "umap", label = TRUE, repel = TRUE, cols = ccolss), gggr, cols = 2)
+dev.off()
+
+png(filename = paste(RES_DIR,"/ClusterIDs/ClusterIDs.png",sep=""),width = 8,height = 6,units = "in",res = 600)
+  DimPlot(pbmc, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'customclassif')+ggtitle('Cluster IDs')
+dev.off()
+
+png(filename = paste(RES_DIR,"/ClusterIDs/ClusterScores.png",sep=""),width = 12,height = 6,units = "in",res = 600)
+  ggplot(cL_resutls,aes(x=cluster,y=type,size=scores,colour=scores))+
+    geom_point(alpha=0.7)+
+    scale_color_gradient(low = 'blue', high = "red")+
+    ggtitle(label = "Cell Type Score by Cluster")
+dev.off()
+
+#saveRDS(pbmc, file = paste(PROG_DIR,"/PBMC_current.RDS",sep=""))
+
+```
+
+```{r ScType Plots, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/ClusterIDs/ClusterMakeUp.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/ClusterIDs/ClusterScores.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/ClusterIDs/ClusterIDs.png",sep=""))
+```
+
+# Sample Distribution and Analysis
+
+Now that the cell clusters have been identified the next step is to look at the make up of each cluster and see if any of the cell types are skewed towards a particular sample or condition. The UMAPS below highlight each sample in particular, while the bar plot shows the cellular frequency of each sample in each cluster. 
+
+Of particular note:
+
+-   The Naive B cell and Plasma cell clusters are almost entirely derived from BM Only cells
+-   The Unknown cluster is primarily derived from aGVHD and Steroid Resistant cells
+-   The NK cell cluster is largely derived from Steroid Responsive cells
+-   Both CD8+ clusters strongly favor thhe aGVHD and Steroid Responsive conditions
+
+```{r Cluster Sample Composition, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+plot1 = DimPlot(pbmc,reduction = "umap",label = T,repel = T,group.by = 'customclassif', 
+        cells.highlight = rownames(pbmc@meta.data)[grep(pattern = unique(pbmc@meta.data$seq_sample)[[1]],pbmc@meta.data$hash.ID)],
+        cols.highlight = "Blue")+ggtitle("BM Only")
+plot2 = DimPlot(pbmc,reduction = "umap",label = T,repel = T,group.by = 'customclassif', 
+        cells.highlight = rownames(pbmc@meta.data)[grep(pattern = unique(pbmc@meta.data$seq_sample)[[2]],pbmc@meta.data$hash.ID)],
+        cols.highlight = "Red")+ggtitle("aGVHD")
+plot3 = DimPlot(pbmc,reduction = "umap",label = T,repel = T,group.by = 'customclassif', 
+        cells.highlight = rownames(pbmc@meta.data)[grep(pattern = unique(pbmc@meta.data$seq_sample)[[3]],pbmc@meta.data$hash.ID)],
+        cols.highlight = "darkgreen")+ggtitle("Steroid Resistant")
+plot4 = DimPlot(pbmc,reduction = "umap",label = T,repel = T,group.by = 'customclassif', 
+        cells.highlight = rownames(pbmc@meta.data)[grep(pattern = unique(pbmc@meta.data$seq_sample)[[4]],pbmc@meta.data$hash.ID)],
+        cols.highlight = "Purple")+ggtitle("Steroid Responsive")
+
+png(filename = paste(RES_DIR,"/SampMatch/SampleUMAP.png",sep=""),width = 18,height = 6,units = "in",res = 600)
+  multiplot(plot1,plot2,plot3,plot4,cols = 4)
+dev.off()
+
+bd = as.data.frame(table(pbmc@meta.data$customclassif[pbmc@meta.data$rep_sample==unique(pbmc@meta.data$rep_sample)[[1]]]))
+bd$Sample = rep(unique(pbmc@meta.data$rep_sample)[[1]],nrow(bd))
+bd = bd[,c(1,3,2)]
+colnames(bd) = c("Cell_Type", "Sample","Freq")
+
+for (i in 2:length(unique(pbmc@meta.data$rep_sample))) {
+  bd2 = as.data.frame(table(pbmc@meta.data$customclassif[pbmc@meta.data$rep_sample==unique(pbmc@meta.data$rep_sample)[[i]]]))
+  bd2$Sample = rep(unique(pbmc@meta.data$rep_sample)[[i]],nrow(bd2))
+  bd2 = bd2[,c(1,3,2)]
+  colnames(bd2) = c("Cell_Type", "Sample","Freq")
+  
+  bd = rbind(bd,bd2)
+}
+
+png(filename = paste(RES_DIR,"/SampMatch/FrequencyPlot.png",sep=""),width = 8,height = 6,units = "in",res = 600)
+  ggplot(bd,aes(x=Cell_Type,y = Freq,fill=factor(Sample,levels = levels(factor(pbmc$HTO_classification))[1:16])))+
+    geom_bar(position = 'stack',stat="identity")+
+    scale_fill_manual(values = tolower(colors),name = "Samples")+ 
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+    ggtitle("Sample Frequency by Cell Type")
+dev.off()
+
+#saveRDS(pbmc, file = paste(PROG_DIR,"/PBMC_current.RDS",sep=""))
+```
+
+```{r Cluster Sample Composition Plots, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/SampMatch/SampleUMAP.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/SampMatch/FrequencyPlot.png",sep=""))
+
+pbmc = readRDS(paste(PROG_DIR,"/PBMC_current.RDS",sep=""))
+clusters = unique(pbmc@meta.data$customclassif)
+
+```
+
+```{r Deep Cluster Sample Composition, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+#pbmc = readRDS(paste(PROG_DIR,"/PBMC_current.RDS",sep=""))
+#BEGIN LOOP HERE
+
+clustnames = gsub(pattern = " ",replacement = "_",x = clusters)
+clustnames = gsub(pattern = "__",replacement = "_",x = clustnames)
+
+j=1
+for (j in 1:length(clusters)) {
+  print(paste(clusters[j]," | ",j," out of ",length(clusters),sep=""))
+  
+  pbmc_subset = subset(pbmc, subset = customclassif==clusters[j])
+  
+  if (dim(pbmc_subset@assays$RNA@counts)[[2]]<50) {
+    print("Not Enough Cells")
+  } else {
+  
+    if (dir.exists(paste(RES_DIR,"/DeepClustAnalysis/",clustnames[j],"/",sep=""))==FALSE) {
+  dir.create(paste(RES_DIR,"/DeepClustAnalysis/",clustnames[j],"/",sep=""))}
+  
+  plot1 =  DimPlot(pbmc_subset,reduction = "umap",label = F,repel = T,group.by = 'HTO_maxID',
+          cols = colors)+ggtitle(label = "First Clustering | By Sample",subtitle = paste(clusters[j]))
+  
+  # Select the top 1000 most variable features
+  pbmc_subset <- FindVariableFeatures(pbmc_subset, selection.method = "mean.var.plot")
+  
+  # Scaling RNA data, we only scale the variable features here for efficiency
+  pbmc_subset <- ScaleData(pbmc_subset, features = VariableFeatures(pbmc_subset))
+  
+  # Run PCA
+  pbmc_subset <- RunPCA(pbmc_subset, features = VariableFeatures(pbmc_subset),npcs = 50)
+  # We select the top 10 PCs for clustering and tSNE based on PCElbowPlot
+  pbmc_subset <- FindNeighbors(pbmc_subset, reduction = "pca", dims = 1:10)
+  pbmc_subset <- FindClusters(pbmc_subset, resolution = 1, verbose = FALSE)
+  
+  pbmc_subset <- RunUMAP(pbmc_subset, dims = 1:10)
+  
+  plot2 = DimPlot(pbmc_subset,reduction = "umap",label = T,repel = T,
+                  group.by ='seurat_clusters')+
+    ggtitle(label = "Second Clustering | By Cluster",subtitle = paste(clusters[j]))
+
+  plot3 = DimPlot(pbmc_subset,reduction = "umap",label = F,repel = T,
+                  group.by = 'HTO_maxID',cols = colors)+
+    ggtitle(label = "Second Clustering | By Sample",subtitle = paste(clusters[j]))
+  
+  png(filename = paste(RES_DIR,"/DeepClustAnalysis/",clustnames[j],"/",clustnames[j],"_UMAPs.png",sep=""),width = 18,height = 6,units = "in",res = 600)
+    multiplot(plot1,plot2,plot3,cols = 3)
+  dev.off()
+  
+  if (length(unique(pbmc_subset@meta.data$seq_sample))!=4) {
+    print('Not Enough Comparisons')
+  } else {
+  
+  plot1 = DimPlot(pbmc_subset,reduction = "umap",label = T,repel = T,group.by = 'seurat_clusters', 
+        cells.highlight = rownames(pbmc_subset@meta.data)[grep(pattern = unique(pbmc_subset@meta.data$seq_sample)[[1]],pbmc_subset@meta.data$hash.ID)],
+        cols.highlight = "Blue")+
+    ggtitle(subtitle = clusters[j],label = "BM Only")+theme(legend.position = 'none')
+  
+  plot2 = DimPlot(pbmc_subset,reduction = "umap",label = T,repel = T,group.by = 'seurat_clusters', 
+        cells.highlight = rownames(pbmc_subset@meta.data)[grep(pattern = unique(pbmc_subset@meta.data$seq_sample)[[2]],pbmc_subset@meta.data$hash.ID)],
+        cols.highlight = "Red")+
+    ggtitle(subtitle = clusters[j],label = "aGVHD")+theme(legend.position = 'none')
+  
+  plot3 = DimPlot(pbmc_subset,reduction = "umap",label = T,repel = T,group.by = 'seurat_clusters', 
+        cells.highlight = rownames(pbmc_subset@meta.data)[grep(pattern = unique(pbmc_subset@meta.data$seq_sample)[[3]],pbmc_subset@meta.data$hash.ID)],
+        cols.highlight = "darkgreen")+
+    ggtitle(subtitle = clusters[j],label = "Steroid Resistant")+theme(legend.position = 'none')
+  
+  plot4 = DimPlot(pbmc_subset,reduction = "umap",label = T,repel = T,group.by = 'seurat_clusters', 
+        cells.highlight = rownames(pbmc_subset@meta.data)[grep(pattern = unique(pbmc_subset@meta.data$seq_sample)[[4]],pbmc_subset@meta.data$hash.ID)],
+        cols.highlight = "Purple")+
+    ggtitle(subtitle = clusters[j],label = "Steroid Responsive")+theme(legend.position = 'none')
+
+  png(filename = paste(RES_DIR,"/DeepClustAnalysis/",clustnames[j],"/",clustnames[j],"_By Sample_UMAPs.png",sep=""),width = 18,height = 6,units = "in",res = 600)
+    multiplot(plot1,plot2,plot3,plot4,cols = 4)
+  dev.off()
+
+  pbmc_subset.markers <- FindAllMarkers(pbmc_subset, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+  pbmc_subset.markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC) -> top5
+  top5 = as.data.frame(top5)
+  
+  if (dir.exists(paste(RES_DIR,"/DeepClustAnalysis/",clustnames[j],"/SubCluster_Markers",sep=""))==FALSE) {
+    dir.create(paste(RES_DIR,"/DeepClustAnalysis/",clustnames[j],"/SubCluster_Markers",sep=""))}
+
+  i=0
+  for (i in 0:(length(unique(top5$cluster))-1)) {
+    png(filename = paste(RES_DIR,"/DeepClustAnalysis/",clustnames[j],"/SubCluster_Markers/Cluster_",i,".png",sep=""),
+      width = 12,height = 3,units = "in",res = 600)
+      print(FeaturePlot(pbmc_subset,features = top5$gene[top5$cluster==i],label = T,ncol = 5)+
+              plot_annotation(paste("Cluster",i,sep=" "),
+                              theme = theme(plot.title = element_text(size = 18,face = "bold")))
+        )
+    dev.off()
+}}}}
+```
+
+# Cluster Deep Analysis {.tabset}
+
+In order to best determine what cell types are going to be worth diving further into, the next step I took was to individually recluster each cell type pseudo-cluster in isolation from one another. Then to check for isolation of treatment conditions within the cell types. If the sub clusters organize primarily by treatment condition it suggests that this is the primary defining comparison left within the cluster. This indicates that there is not a further sub cell type to parse out from the cluster, but that we can instead move onto differential expression testing and gene set enrichment analysis. This method also allows us to identify which cell type pseudo-clusters lack either the appropriate cell counts, or internal variance, for deeper analysis. 
+
+Based on this criteria the following cell pseudo-clusters are worth performing DE and GSEA on:
+
+-   CD8+ NKT-Like Cells
+-   Effector CD4+ T Cells
+-   Memory CD8+ T Cells
+
+<hr class="solid">
+
+``` {r DeepCluster Plot Tabs,dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T, dpi = 300, fig.width = 12, results="asis"}
+tabs = list.dirs(paste(RES_DIR,"/DeepClustAnalysis/",sep=""),recursive = F,full.names = F)
+
+for (l in 1:length(tabs)) {
+  cat('\n\n##', tabs[l], ' \n\n')
+    if (file.exists(paste(RES_DIR,"/DeepClustAnalysis/",tabs[l],"/",tabs[l],"_UMAPs.png",sep=""))==TRUE) {
+      cat("![](",RES_DIR,"/DeepClustAnalysis/",tabs[l],"/",tabs[l],"_UMAPs.png",")",sep="")
+    } 
+    if (file.exists(paste(RES_DIR,"/DeepClustAnalysis/",tabs[l],"/",tabs[l],"_By Sample_UMAPs.png",sep=""))==TRUE) {
+          cat("![](",RES_DIR,"/DeepClustAnalysis/",tabs[l],"/",tabs[l],"_By Sample_UMAPs.png",")",sep="")
+    } 
+      if (dir.exists(paste(RES_DIR,"/DeepClustAnalysis/",tabs[l],"/SubCluster_Markers/",sep = ""))==TRUE) {
+        imgs = list.files(paste(RES_DIR,"/DeepClustAnalysis/",tabs[l],"/SubCluster_Markers/",sep = ""),full.names = T)
+        names = list.files(paste(RES_DIR,"/DeepClustAnalysis/",tabs[l],"/SubCluster_Markers/",sep = ""),full.names = F)
+        cat('\n\n###','Differentially Expresseed Cluster Markers {.tabset}','\n\n')
+        for (q in 1:length(imgs)) {
+          cat('\n\n####',names[q],'\n\n')
+          cat("![](",imgs[q],")",sep="")
+        }
+        cat('\n\n###  {.unnumbered} \n\n')
+    }
+  cat('\n\n##  {.unnumbered} \n\n')
+}
+
+```
+
+# {-}
+
+<hr class="solid">
+
+# Differential Expression and GSEA by Cell Type Pseudo-Cluster using iDEA{.tabset}
+
+Article: [<https://www.nature.com/articles/s41467-020-15298-6>]
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+We developed a new computational method, iDEA, that enables powerful DE and GSE analysis for scRNAseq studies through integrative statistical modeling. Our method builds upon a hierarchical Bayesian model for joint modeling of DE and GSE analyses. It uses only summary statistics as input, allowing for effective data modeling through complementing and pairing with various existing DE methods. It relies on an efficient expectation-maximization algorithm with internal Markov Chain Monte Carlo steps for scalable inference. By integrating DE and GSE analyses, iDEA can improve the power and consistency of DE analysis and the accuracy of GSE analysis over common existing approaches. iDEA is implemented as an R package with source code freely available at: www.xzlab.org/software.html.
+</font>
+</div>
+
+```{r Prepare Summary Statistics, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+#pbmc = readRDS(paste(PROG_DIR,"/PBMC_current.RDS",sep=""))
+
+clusters = unique(pbmc@meta.data$customclassif)
+names(colors) = unique(pbmc@meta.data$HTO_maxID)[c(4,3,1,2,8,7,5,6,11,12,9,10,16,13,14,15)]
+
+group_colors = colors[c(4,8,12,16)]
+names(group_colors) = gsub(pattern = "-R4",replacement = "",x = names(group_colors))
+
+# Extract raw counts and metadata to create SingleCellExperiment object
+counts <- pbmc@assays$RNA@counts 
+metadata <- pbmc@meta.data
+# Set up metadata as desired for aggregation and DE analysis
+metadata$cluster_id <- factor(pbmc@active.ident)
+# Create single cell experiment object
+sce <- SingleCellExperiment(assays = list(counts = counts), 
+                           colData = metadata)
+# Identify groups for aggregation of counts
+groups <- colData(sce)[, c("customclassif", "rep_sample")]
+# Named vector of cluster names
+kids <- purrr::set_names(unique(sce$customclassif))
+# Total number of clusters
+nk <- length(kids)
+# Named vector of sample names
+sids <- purrr::set_names(unique(sce$rep_sample)[c(4,3,1,2,8,7,5,6,11,12,9,10,16,13,14,15)])
+# Total number of samples 
+ns <- length(sids)
+# Generate sample level metadata
+## Determine the number of cells per sample
+table(sce$rep_sample)
+## Turn named vector into a numeric vector of number of cells per sample
+n_cells <- as.numeric(table(sce$rep_sample))
+## Determine how to reoder the samples (rows) of the metadata to match the order of sample names in sids vector
+m <- match(sids, sce$rep_sample)
+## Create the sample level metadata by combining the reordered metadata with the number of cells corresponding to each sample.
+ei <- data.frame(colData(sce)[m, ], 
+                  n_cells, row.names = NULL)
+ei = ei[,c(15,16,20)]
+colnames(ei) = c("group_id","sample_id","n_cells")
+# Perform QC if not already performed
+## Remove lowly expressed genes which have less than 10 cells with any counts
+sce <- sce[rowSums(counts(sce) > 1) >= 10, ]
+# Calculate quality control (QC) metrics
+sceqc <- perCellQCMetrics(sce)
+# Get cells w/ few/many detected genes
+sceqc$is_outlier <- isOutlier(
+        metric = sceqc$total,
+        nmads = 2, type = "both", log = TRUE)
+# Remove outlier cells
+sceqc <- sceqc[!sceqc$is_outlier,]
+sce = sce[,match(rownames(sceqc),colnames(sce))]
+# Aggregate the counts per sample_id and cluster_id
+# Subset metadata to only include the cluster and sample IDs to aggregate across
+groups <- colData(sce)[, c("customclassif", "rep_sample")]
+# Aggregate across cluster-sample groups
+pb <- aggregate.Matrix(t(counts(sce)), 
+                       groupings = groups, fun = "sum") 
+# Not every cluster is present in all samples; create a vector that represents how to split samples
+splitf <- sapply(stringr::str_split(rownames(pb), 
+                                    pattern = "_",  
+                                    n = 2), 
+                 `[`, 1)
+pb <- split.data.frame(pb, 
+                       factor(splitf)) %>%
+        lapply(function(u) 
+                set_colnames(t(u), 
+                             stringr::str_extract(rownames(u), "(?<=_)[:alnum:]+-R\\d")))
+options(width = 100)
+table(sce$customclassif, sce$rep_sample)
+# Get sample names for each of the cell type clusters
+# prep. data.frame for plotting
+get_sample_ids <- function(x){
+        pb[[x]] %>%
+                colnames()
+}
+de_samples <- map(1:length(kids), get_sample_ids) %>%
+        unlist()
+# Get cluster IDs for each of the samples
+samples_list <- map(1:length(kids), get_sample_ids)
+get_cluster_ids <- function(x){
+        rep(names(pb)[x], 
+            each = length(samples_list[[x]]))
+}
+de_cluster_ids <- map(1:length(kids), get_cluster_ids) %>%
+        unlist()
+gg_df <- data.frame(cluster_id = de_cluster_ids,
+                    sample_id = de_samples)
+gg_df <- left_join(gg_df, ei[, c("sample_id", "group_id")]) 
+metadata <- gg_df %>%
+        dplyr::select(cluster_id, sample_id, group_id) 
+# Generate vector of cluster IDs
+clusters <- unique(metadata$cluster_id)
+clusters
+```
+
+```{r Differential Expression and GSEA Construction Zone, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F, eval=F}
+##WARNING!!!!!!!!!!! This is a Construction Zone!!!! DO NOT RUN CODE AUTOMATICALLY!!!!!!
+clusters
+
+clustnum=3
+clusters[clustnum]
+
+clustnames = gsub(pattern = " ",replacement = "_",x = clusters)
+clustnames = gsub(pattern = "__",replacement = "_",x = clustnames)
+
+clustnames[clustnum]
+
+
+SAVE_DIR = paste(RES_DIR,"/DeepClustAnalysis/",clustnames[clustnum],"/DE",sep="")
+if (dir.exists(paste(SAVE_DIR))==FALSE) {
+  dir.create(paste(SAVE_DIR))}
+
+# Subset the metadata to only the CD8+ NKT-Like Cells
+cluster_metadata <- metadata[which(metadata$cluster_id == clusters[clustnum]), ]
+head(cluster_metadata)
+
+# Assign the rownames of the metadata to be the sample IDs
+rownames(cluster_metadata) <- cluster_metadata$sample_id
+
+# Subset the counts to only the B cells
+counts <- pb[[clusters[clustnum]]]
+
+cluster_counts <- data.frame(counts[, which(colnames(counts) %in% rownames(cluster_metadata))])
+colnames(cluster_counts) = gsub(pattern = ".",replacement = "-",x = colnames(cluster_counts),fixed = T)
+
+# Check that all of the row names of the metadata are the same and in the same order as the column names of the counts in order to use as input to DESeq2
+all(rownames(cluster_metadata) == colnames(cluster_counts))    
+
+dds <- DESeqDataSetFromMatrix(cluster_counts, 
+                              colData = cluster_metadata, 
+                              design = ~ group_id)
+
+# Transform counts for data visualization
+rld <- rlog(dds, blind=TRUE)
+
+# Plot PCA
+ntop = 500
+pcaDataAll <- pca(assays(rld)[[1]], 
+                  metadata = as.data.frame(colData(rld)),
+                  removeVar = 1-(ntop/dim(assays(rld)[[1]])[[1]]))
+
+plot1 = biplot(pcaDataAll,
+               colby = 'group_id', 
+               colkey = group_colors,
+               encircle = TRUE,
+               encircleFill = TRUE,
+               hline = 0, 
+               vline = c(-25, 0, 25),
+               pointSize = 6,
+               labSize = 2,
+               legendPosition = "none")
+
+# Extract the rlog matrix from the object and compute pairwise correlation values
+rld_mat <- assay(rld)
+rld_cor <- cor(rld_mat)
+
+annot = data.frame('Groups' = cluster_metadata[, c("group_id"),drop=F])
+colnames(annot) = "Group_IDs"
+
+# Plot heatmap
+plot2 =pheatmap::pheatmap(rld_cor,
+                 annotation_row = annot,
+                 annotation_col = annot,
+                 annotation_colors =list(Group_IDs = group_colors),
+                 cutree_rows = 2,cutree_cols = 2)
+
+png(filename = paste(SAVE_DIR,"/Clustering_Multi.png",sep=""),width = 12,height = 6,units = 'in',res = 600)
+  grid.arrange(plot1, plot2[[4]],layout_matrix = rbind(c(1,2),c(1,2)))
+dev.off()
+
+# Run DESeq2 differential expression analysis
+dds <- DESeq(dds)
+# Plot dispersion estimates
+png(filename = paste(SAVE_DIR,"/DispEst.png",sep=""),width = 6,height = 6,units = "in",res = 600)
+  plotDispEsts(dds)
+dev.off()
+
+# Output results of Wald test for contrast for stim vs ctrl
+res = results(dds)
+
+resultsNames(dds)
+resultsNames(dds)[2]
+
+unique(cluster_metadata$group_id)
+
+comp1 = unique(cluster_metadata$group_id)[2]
+comp2 = unique(cluster_metadata$group_id)[1]
+
+contrast <- c("group_id", comp1, comp2)
+contrast
+
+res <- results(dds, 
+               contrast = contrast,
+               alpha = 0.05)
+
+res <- lfcShrink(dds, 
+                 coef = 2,
+                 res=res)
+
+# Turn the results object into a tibble for use with tidyverse functions
+res_tbl <- res %>%
+        data.frame() %>%
+        rownames_to_column(var="gene") %>%
+        as_tibble()
+
+# Check results output
+res_tbl
+
+# Write all results to file
+write.csv(res_tbl,
+          paste(SAVE_DIR,"/",resultsNames(dds)[[2]],"_all_genes.csv",sep = ""),
+          quote = FALSE, 
+          row.names = FALSE)
+
+# Set thresholds
+padj_cutoff <- 0.05
+
+# Subset the significant results
+sig_res <- dplyr::filter(res_tbl, padj < padj_cutoff) %>%
+        dplyr::arrange(padj)
+
+# Check significant genes output
+sig_res
+
+# Write significant results to file
+write.csv(sig_res,
+          paste(SAVE_DIR,"/",resultsNames(dds)[[2]],"_sig_genes.csv",sep = ""),
+          quote = FALSE, 
+          row.names = FALSE)
+
+## ggplot of top genes
+normalized_counts <- counts(dds, 
+                            normalized = TRUE)
+
+## Order results by padj values
+top20_sig_genes <- sig_res %>%
+        dplyr::arrange(padj) %>%
+        dplyr::pull(gene) %>%
+        head(n=20)
+
+
+top20_sig_norm <- data.frame(normalized_counts) %>%
+        rownames_to_column(var = "gene") %>%
+        dplyr::filter(gene %in% top20_sig_genes)
+
+gathered_top20_sig <- top20_sig_norm %>%
+        gather(colnames(top20_sig_norm)[2:length(colnames(top20_sig_norm))], key = "samplename", value = "normalized_counts")
+
+gathered_top20_sig$samplename=gsub(pattern = ".",replacement = "-",x = gathered_top20_sig$samplename,fixed = T)
+        
+gathered_top20_sig <- inner_join(ei[, c("sample_id", "group_id" )], gathered_top20_sig, by = c("sample_id" = "samplename"))
+
+## plot using ggplot2
+plot2 = ggplot(gathered_top20_sig) +
+  geom_point(aes(x = gene, 
+                 y = normalized_counts, 
+                 color = group_id), 
+             position=position_jitter(w=0.1,h=0)) +
+  scale_y_log10() + scale_color_manual(values = group_colors) +
+  xlab("Genes") +
+  ylab("log10 Normalized Counts") +
+  ggtitle(paste("Top 20 Significant DEGs between ",comp1," and ",comp2,sep="")) +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5),
+        legend.position = "none")
+  
+# Extract normalized counts for only the significant genes
+sig_norm <- data.frame(normalized_counts) %>%
+        rownames_to_column(var = "gene") %>%
+        dplyr::filter(gene %in% sig_res$gene)
+colnames(sig_norm)=gsub(pattern = ".",replacement = "-",x = colnames(sig_norm),fixed = T)
+        
+# Set a color palette
+heat_colors <- brewer.pal(6, "YlOrRd")
+
+# Run pheatmap using the metadata data frame for the annotation
+plot3 = pheatmap(sig_norm[ , 2:length(colnames(sig_norm))], 
+                 color = heat_colors,cutree_rows = 2,cutree_cols = 2,
+                 cluster_rows = T, 
+                 show_rownames = F,
+                 annotation = cluster_metadata[, c("group_id", "cluster_id")], 
+                 border_color = NA, 
+                 fontsize = 10, 
+                 scale = "row",
+                 fontsize_row = 10, 
+                 height = 20,
+                 annotation_colors =list(group_id = group_colors),
+                 main = paste("Significant DEGs between ",comp1," vs ", comp2,sep=""))
+
+## Obtain logical vector where TRUE values denote padj values < 0.05 and fold change > 1.5 in either direction
+res_table_thres <- res_tbl %>% 
+                  mutate(threshold = padj < 0.05 & abs(log2FoldChange) >= 0.58)
+                  
+## Volcano plot
+plot1 = ggplot(res_table_thres)+
+  geom_point(aes(x = log2FoldChange, y = -log10(padj), colour = threshold))+
+  scale_color_manual(values = c("grey50","red"))+
+  ggtitle(paste("Volcano plot of ",comp1," vs ",comp2,sep=""))+
+  xlab("log2 fold change")+
+  ylab("-log10 adjusted p-value")+
+  scale_y_continuous(limits = c(0,50))+
+  theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        axis.title = element_text(size = rel(1.25))) +
+  geom_label_repel(data = subset(res_table_thres,res_table_thres$threshold==T),
+                   aes(label = gene,x=log2FoldChange,y=-log10(padj)),
+                   colour = 'black',size=1.5, max.overlaps = 15, min.segment.length = 0)+
+  annotate(geom="text", x=5.3, y=50, label=paste(comp1))+
+  annotate(geom="text", x=-2.5, y=50, label=paste(comp2))
+
+
+
+png(filename = paste(SAVE_DIR,"/TopGene_Multi.png",sep=""),width = 18,height = 6,units = 'in',res = 600)
+  grid.arrange(plot1,plot2,plot3[[4]],layout_matrix = rbind(c(1,2,3),c(1,2,3),c(1,2,3)))
+dev.off()
+
+#Implimentation of iDEA for GSEA
+## Assume you have obtained the DE results from i.e. zingeR, edgeR or MAST with the data frame res_DE (column: pvalue and LogFC)
+pvalue = res_table_thres$padj
+zscore = qnorm(pvalue/2.0, lower.tail=FALSE) #### convert the pvalue to z-score
+beta = res_table_thres$log2FoldChange ## effect size
+se_beta = abs(beta/zscore) ## to approximate the standard error of beta
+beta_var = se_beta^2  ### square 
+summary = data.frame(beta = beta,beta_var = beta_var)
+## add the gene names as the rownames of summary
+rownames(summary) = res_table_thres$gene ### or the gene id column in the res_DE results
+
+summary_data = summary
+
+types = sapply(gsc, function(elt) bcCategory(collectionType(elt)))
+subtypes = sapply(gsc, function(elt) bcSubCategory(collectionType(elt)))
+
+gs_sc = gsc[types =="h" | 
+            types =="c2" & subtypes =="CP:KEGG" | 
+            types =="c2" & subtypes =="CP:BIOCARTA"|
+            types =="c2" & subtypes =="CP:PID"|
+            types =="c2" & subtypes =="CP:REACTOME"|
+            types =="c8"]
+
+#toGmt(x = gs_sc, con = paste(DATA_DIR,"/Enrichment/HALLMARK.gmt", sep=""))
+#myGsc<-loadGSC(file=file.path(DATA_DIR,"/Enrichment/HALLMARK.gmt"))
+#names(myGsc$gsc)<-gsub("HALLMARK_", "", names(myGsc$gsc))
+
+gseaGenes = data.frame(unique(as.vector(unlist(geneIds(gs_sc)))))
+colnames(gseaGenes) = 'gseaGenes'
+
+annotable = gseaGenes
+
+i=1
+for (i in 1:length(gs_sc)) {
+  annotable$tmp = ifelse(annotable$gseaGenes %in% geneIds(gs_sc[[i]]),1,0)
+  names(annotable)[i+1] = names(gs_sc[i])
+}
+
+annotation_data = annotable
+rownames(annotation_data) = annotable$gseaGenes
+annotation_data$gseaGenes = NULL
+
+rownames(summary_data)=toupper(rownames(summary_data))
+
+idea <- CreateiDEAObject(summary_data, annotation_data, max_var_beta = 100, min_precent_annot = 0.0025, num_core=8)
+idea@num_core = 8
+
+idea <- iDEA.fit(idea,
+                 fit_noGS=FALSE,
+                 init_beta=NULL, 
+                 init_tau=c(-2,0.5),
+                 min_degene=15,
+                 em_iter=15,
+                 mcmc_iter=1000, 
+                 fit.tol=1e-5,
+                 modelVariant = F,
+                 verbose=TRUE, 
+                 um_core=8)
+
+idea <- iDEA.louis.edit(idea)
+
+idea@gsea[idea@gsea$pvalue_louis<=0.05,]
+
+saveRDS(idea,file = paste(SAVE_DIR,'/IDEA.rds',sep=""))
+#idea = readRDS(file = paste(SAVE_DIR,'/IDEA.rds',sep=""))
+
+plotdata = idea@gsea
+
+
+plotdata[plotdata$annot_id %in% names(gsc[types =="h"]),]
+plotdata$category[plotdata$annot_id %in% names(gsc[types =="h"])] = rep("HALLMARK",dim(plotdata[plotdata$annot_id %in% names(gsc[types =="h"]),])[1])
+
+plotdata$category[plotdata$annot_id %in% names(gsc[types =="c2" & subtypes =="CP:KEGG"])] = rep("KEGG",dim(plotdata[plotdata$annot_id %in% names(gsc[types =="c2" & subtypes =="CP:KEGG"]),])[1])
+plotdata$category[plotdata$annot_id %in% names(gsc[types =="c2" & subtypes =="CP:BIOCARTA"])] = rep("BIOCARTA",dim(plotdata[plotdata$annot_id %in% names(gsc[types =="c2" & subtypes =="CP:BIOCARTA"]),])[1])
+plotdata$category[plotdata$annot_id %in% names(gsc[types =="c2" & subtypes =="CP:PID"])] = rep("PID",dim(plotdata[plotdata$annot_id %in% names(gsc[types =="c2" & subtypes =="CP:PID"]),])[1])
+plotdata$category[plotdata$annot_id %in% names(gsc[types =="c2" & subtypes =="CP:REACTOME"])] = rep("REACTOME",dim(plotdata[plotdata$annot_id %in% names(gsc[types =="c2" & subtypes =="CP:REACTOME"]),])[1])
+plotdata$category[plotdata$annot_id %in% names(gsc[types =="c8"])] = rep("CELL_TYPE",dim(plotdata[plotdata$annot_id %in% names(gsc[types =="c8"]),])[1])
+
+sizes = as.data.frame(lengths(geneIds(gs_sc)))
+sizes$annot_id = rownames(sizes)
+sizes = sizes[,c(2,1)]
+colnames(sizes)[2] = "count"
+
+plotdata = merge(plotdata,sizes,by='annot_id')
+plotdata = plotdata[order(plotdata$category),]
+
+# GSEA for Left Comparator
+pvaluecutoff = 10^-20
+plotdata1 = plotdata[plotdata$annot_coef>0,]
+sig = data.frame(plotdata1[plotdata1$pvalue_louis <=pvaluecutoff,])
+
+p4 = ggplot(plotdata1, aes(x = annot_id, y = -log10(pvalue_louis),color = category))+
+  geom_point(shape = 19,aes(fill = category, size = count,shape = 19),alpha=0.8)+
+  scale_radius()+scale_x_discrete(limits = as.vector(plotdata$annot_id))+
+  labs(x = "", y = expression(paste(bold(-log[10]),bold("("),bolditalic(p),bold("-value)"))))+
+  theme(plot.margin = margin(1, 1, 1, 1, "cm"),
+        axis.text.x=element_blank(),
+        plot.title = element_text(lineheight=.8, face="bold"),
+        axis.text = element_text(size = 20),
+        axis.line = element_line(colour = 'black'),
+        axis.ticks = element_line(colour = 'grey80'),
+        axis.title = element_text(size = 20, face = 'bold'),
+        axis.title.y = element_text(margin = margin(t = 0, r = 20, b = 0, l = 0)),
+        title = element_text(size = 25),
+        legend.title=element_text(size=24,face = 'bold'),
+        legend.text=element_text(size=24),
+        panel.background = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(colour = 'white'),
+        plot.background = element_blank(),
+        legend.key = element_rect(color = "transparent", fill = "transparent"))+
+  geom_hline(yintercept = -log10(pvaluecutoff), col = 'black',linetype = 2,size=2)+
+  guides(color = guide_legend(order = 1,override.aes = list(alpha = 1,size=7)),
+         size = guide_legend(order = 2,override.aes = list(alpha = 1,shape=21)),
+         fill = FALSE)+ labs(size = "Gene set size")+
+  scale_color_manual(values=c("salmon","gold2","#42d4f4","#3cb44b","chocolate2","#4363d8","#bfef45","#911eb4","#f032e6","#a9a9a9"))+
+  scale_fill_manual(values = c("salmon","gold2","#42d4f4","#3cb44b","chocolate2","#4363d8","#bfef45","#911eb4","#f032e6","#a9a9a9"))+
+  theme(legend.direction = "vertical")+
+  theme(legend.box = "vertical")+
+  theme(legend.title.align = 0)+
+  geom_label_repel(data = sig,
+                  aes(label = annot_id),
+                  point.padding=unit(1.1,'lines'),
+                  box.padding = unit(0.1, "lines"),
+                  hjust = 0.2,
+                  size = 2,
+                  direction='y',
+                  col = "black")+
+  ggtitle(label = paste("Blind Enriched GSEA Terms for ",clusters[clustnum],sep=""),
+          subtitle = paste("Louis adjusted p-value cut off: ",pvaluecutoff," \nPositive Enrichement in ",
+          unique(cluster_metadata$group_id)[2],sep=""))
+
+print(p4)
+
+png(paste(SAVE_DIR,"/GSEA_Bubble_",unique(cluster_metadata$group_id)[2],".png",sep=""),width = 12500, height = 7500, res = 600)
+  print(p4)
+dev.off()
+
+# GSEA for Right Comparator
+pvaluecutoff = 10^-2
+plotdata2 = plotdata[plotdata$annot_coef<0,]
+sig = data.frame(plotdata2[plotdata2$pvalue_louis <=pvaluecutoff,])
+
+p4 = ggplot(plotdata2, aes(x = annot_id, y = -log10(pvalue_louis),color = category))+
+  geom_point(shape = 19,aes(fill = category, size = count,shape = 19),alpha=0.8)+
+  scale_radius()+scale_x_discrete(limits = as.vector(plotdata$annot_id))+
+  labs(x = "", y = expression(paste(bold(-log[10]),bold("("),bolditalic(p),bold("-value)"))))+
+  theme(plot.margin = margin(1, 1, 1, 1, "cm"),
+        axis.text.x=element_blank(),
+        plot.title = element_text(lineheight=.8, face="bold"),
+        axis.text = element_text(size = 20),
+        axis.line = element_line(colour = 'black'),
+        axis.ticks = element_line(colour = 'grey80'),
+        axis.title = element_text(size = 20, face = 'bold'),
+        axis.title.y = element_text(margin = margin(t = 0, r = 20, b = 0, l = 0)),
+        title = element_text(size = 25),
+        legend.title=element_text(size=24,face = 'bold'),
+        legend.text=element_text(size=24),
+        panel.background = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(colour = 'white'),
+        plot.background = element_blank(),
+        legend.key = element_rect(color = "transparent", fill = "transparent"))+
+  geom_hline(yintercept = -log10(pvaluecutoff), col = 'black',linetype = 2,size=2)+
+  guides(color = guide_legend(order = 1,override.aes = list(alpha = 1,size=7)),
+         size = guide_legend(order = 2,override.aes = list(alpha = 1,shape=21)),
+         fill = FALSE)+ labs(size = "Gene set size")+
+  scale_color_manual(values=c("salmon","gold2","#42d4f4","#3cb44b","chocolate2","#4363d8","#bfef45","#911eb4","#f032e6","#a9a9a9"))+
+  scale_fill_manual(values = c("salmon","gold2","#42d4f4","#3cb44b","chocolate2","#4363d8","#bfef45","#911eb4","#f032e6","#a9a9a9"))+
+  theme(legend.direction = "vertical")+
+  theme(legend.box = "vertical")+
+  theme(legend.title.align = 0)+
+  geom_label_repel(data = sig,
+                  aes(label = annot_id),
+                  point.padding=unit(1.1,'lines'),
+                  box.padding = unit(0.1, "lines"),
+                  hjust = 0.2,
+                  size = 2,
+                  direction='y',
+                  col = "black")+
+  ggtitle(label = paste("Blind Enriched GSEA Terms for ",clusters[clustnum],sep=""),
+          subtitle = paste("Louis adjusted p-value cut off: ",pvaluecutoff," \nPositive Enrichement in ",
+          unique(cluster_metadata$group_id)[1],sep=""))
+
+print(p4)
+
+png(paste(SAVE_DIR,"/GSEA_Bubble_",unique(cluster_metadata$group_id)[1],".png",sep=""),width = 12500, height = 7500, res = 600)
+  print(p4)
+dev.off()
+
+```
+
+## CD8+ NKT-Like Cells
+
+```{r CD8+ NKT-Like Cells Differential Expression, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/CD8+_NKT-like_cells/DE/Clustering_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/CD8+_NKT-like_cells/DE/TopGene_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/CD8+_NKT-like_cells/DE/GSEA_Bubble_BMOnly.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/CD8+_NKT-like_cells/DE/GSEA_Bubble_aGVHD.png",sep=""))
+```
+
+## Effector CD4+ T Cells
+
+```{r Effector CD4+ T Cells Differential Expression, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Effector_CD4+_T_cells/DE/Clustering_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Effector_CD4+_T_cells/DE/TopGene_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Effector_CD4+_T_cells/DE/GSEA_Bubble_BMOnly.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Effector_CD4+_T_cells/DE/GSEA_Bubble_aGVHD.png",sep=""))
+```
+
+
+## Memory CD8+ T Cells
+
+```{r Memory CD8+ T Cells Differential Expression, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Memory_CD8+_T_cells/DE/Clustering_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Memory_CD8+_T_cells/DE/TopGene_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Memory_CD8+_T_cells/DE/GSEA_Bubble_BMOnly.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Memory_CD8+_T_cells/DE/GSEA_Bubble_aGVHD.png",sep=""))
+```
+
+# {-}
+
+# Session Info
+
+```{r Appendix,echo=FALSE,class.source = 'fold-hide'}
+sessionInfo()
+getwd()
+```
