@@ -1,0 +1,505 @@
+---
+title: "Blazar Project 017"
+subtitle: "Fifth Pass_Singlets"
+author: "Michael Zaiken"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    css: tactile.css
+    code_folding: show
+editor_options: 
+  chunk_output_type: console
+  markdown: 
+    wrap: 92
+knit: (function(inputFile, encoding) { 
+          rmarkdown::render(inputFile,
+                        encoding=encoding,                        
+                        output_dir=dirname(dirname(dirname(dirname(getwd())))),
+                        output_file='Blazar_Project_017.html') })
+---
+
+<hr class="rounded">
+
+# Major Questions and Goals:
+
+## Sample Groups:
+-   BM Only
+-   aGVHD
+-   Steroid Resistant aGVHD
+-   Steroid Responsive aGVHD
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+### Important Note:
+Text shown in a smaller font is from the Seurat manual. It is meant to give a technical explanation of each step of the analysis but does not itself contain any critical information for the interpretation of this report.
+</div>
+
+```{r Environment_Set_Up, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=F}
+source("./scRNAseq_LoadIn.R")
+
+colors = c(rev(brewer.pal(8,"Blues")[5:8]),
+           rev(brewer.pal(8,"Reds")[5:8]),
+           rev(brewer.pal(8,"Greens")[5:8]),
+           rev(brewer.pal(8,"Purples")[5:8]))
+
+load(paste(RES_DIR,"/Variables.RData",sep=""))
+
+if (getwd()!=RMD_DIR) {
+  rstudioapi::documentSave()
+  
+  file.copy(from = grep(list.files(getwd()),pattern='.html', invert=TRUE, value=TRUE),
+            to = RMD_DIR,overwrite = T,recursive = T)
+  
+  print("Files have been copied to new directory. Please reopen from new location")
+  rstudioapi::navigateToFile(paste(RMD_DIR,"/Blazar_Lab_scRNAseq_Pipeline_Reporter.Rmd",sep=""))
+  rstudioapi::navigateToFile(paste(RMD_DIR,"/Blazar_Lab_scRNAseq_Pipeline_Analyzer.Rmd",sep=""))
+  rstudioapi::navigateToFile(paste(RMD_DIR,"/scRNAseq_LoadIn.R",sep=""))
+  rstudioapi::navigateToFile(paste(RMD_DIR,"/tactile.css",sep=""))
+  setwd(RMD_DIR)
+  print(getwd())
+} else {
+  print("Files are in correct source location, continue operation")
+}
+```
+
+<hr class="solid">
+
+# Demultiplexing of Samples
+
+Samples came in the form of 4 sequencing samples, with 4 multiplexed replicates per sample. Prior to analysis, replicates must be demultiplexed from samples, and filtered for doublet cells. Doublets arise as a result of multiple hashtags being associated with a given cell. This most likely happens by overloading the 10X wells in order to capture multiplexed samples and is expected.
+
+Because each sequencing sample contains 4 biological replicates **from the same treatment condition** it is actually possible to include doublets in the analysis provided that they can be correctly mapped back to the correct group. 
+
+In this report **all doublet cells have been removed**. However bear in mind that they can be added back in if we so choose.  
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+Developed in collaboration with the Technology Innovation Group at NYGC, Cell Hashing uses oligo-tagged antibodies against ubiquitously expressed surface proteins to place a “sample barcode” on each single cell, enabling different samples to be multiplexed together and run in a single experiment. For more information, please refer to this paper.
+
+Output from running HTODemux() is saved in the object metadata. We can visualize how many cells are classified as singlets, doublets and negative/ambiguous cells.
+
+The demultiplexing function HTODemux() implements the following procedure:
+-   We perform a k-medoid clustering on the normalized HTO values, which initially separates cells into K(# of samples)+1 clusters.
+-   We calculate a ‘negative’ distribution for HTO. For each HTO, we use the cluster with the lowest average value as the negative group.
+-   For each HTO, we fit a negative binomial distribution to the negative cluster. We use the 0.99 quantile of this distribution as a threshold.
+-   Based on these thresholds, each cell is classified as positive or negative for each HTO.
+-   Cells that are positive for more than one HTOs are annotated as doublets.
+</font>
+</div>
+
+In the following Ridge Plots each replicate in a sample is checked for the expression of hash tags unique to other replicates. This allows us to visually demonstrate that each replicate has been successfully separated from the others in its sample. Unmapped cells did not have an associated hashtag, and are later discarded from the analysis. 
+
+```{r DeMultiplexing Results 1, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+slickR(list.files(path = paste(RES_DIR,"/DeMulti/",sep=""),pattern = "RidgePlot_",full.names = T)[c(2,1,3,4)],height = 300)
+```
+
+After all samples have been succsessfully seperated, they are merged into a single data object, allowing us to quantify how many cells are evaluable for further analysis. These are divided out as Negative cells which lack a hashtag, doublets which contain multiple hashtags, and singlets which have only a single hashtag. In this case after merging the breakdown is:
+
+-   Negative Cells: `r NegativeCells`
+-   Doublet Cells: `r DoubletCells`
+-   Singlet Cells: `r SingletCells`
+
+```{r DeMultiplexing Results 2, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeMulti/DoubletCounts",".png",sep=""))
+```
+
+We can further map out the singlets and demonstrate that while doublets are present in the data, because the replicates for each condition are pooled into a single sample rather than divided across samples, they still cluster with the appropriate singlets within a tSNE space.
+
+```{r DeMultiplexing Results 3, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeMulti/DoubletMapping_BySample",".png",sep=""))
+```
+
+Finally we can seperate out the singlets from the doublets, finalizing our data structure for deeper analysis. Once more note how the replicates of each sample co-cluster into defined regions with the t-SNE plot. 
+
+```{r DeMultiplexing Results 4, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeMulti/Singlet_IDs",".png",sep=""))
+```
+
+<hr class="solid">
+
+# QC and Cell Selection
+
+Now that the data is structured correctly, and only singlet cells remain in the analysis, we first need to filter out remaining cells that are likely of low quality. We do this by analyzing a number of quality control metrics including: the number of identified features (genes) per cell, the number of counts (reads) that mapped to each cell, and the percentage of those reads that are derived from mitochondrial DNA. 
+
+Excess features or genes mapped to a cell is indicative of a doublet or multiplet that got through initial screening. Similarly excessive mitochondrial reads indicates either free mitochondria contaminating the sample, or cells that are dying. 
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Seurat allows you to easily explore QC metrics and filter cells based
+on any user-defined criteria. A few QC metrics commonly used by the
+community include:*
+
+-   *The number of unique genes detected in each cell.*
+-   *Low-quality cells or empty droplets will often have very few genes*
+-   *Cell doublets or multiplets may exhibit an aberrantly high gene
+    count*
+-   *Similarly, the total number of molecules detected within a cell
+    (correlates strongly with unique genes)*
+-   *The percentage of reads that map to the mitochondrial genome*
+-   *Low-quality / dying cells often exhibit extensive mitochondrial
+    contamination*
+
+*We calculate mitochondrial QC metrics with the PercentageFeatureSet()
+function, which calculates the percentage of counts originating from a
+set of features - We use the set of all genes starting with MT- as a set
+of mitochondrial genes*
+</font>
+</div>
+
+### Feature Comparisons prior to data subsetting
+
+```{r QC and Cell Selection Plot Pre, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/QC_Plots","/QC_metrics_pre-subset.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/QC_Plots","/Metric_compare_pre-subset.png",sep=""))
+```
+
+Based on the plots above the following cutoffs were used for data
+subsetting based on QC:
+
+-   nFeature_RNA = \>`r nfeature_thresh_min` & \<`r nfeature_thresh_max`
+-   percent.mt = `r percent.mt_thresh`
+-   nCount_RNA = \<`r ncount_thresh_max` 
+-   Multiplexing doublets and negatives are also removed
+
+### Feature Comparisons post data subsetting
+
+```{r QC and Cell Selection Plot 3, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/QC_Plots","/QC_metrics_post-subset.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/QC_Plots","/Metric_compare_post-subset.png",sep=""))
+```
+
+<hr class="solid">
+
+# Normalizing the data
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*After removing unwanted cells from the dataset, the next step is to
+normalize the data. By default, we employ a global-scaling normalization
+method "LogNormalize" that normalizes the feature expression
+measurements for each cell by the total expression, multiplies this by a
+scale factor (10,000 by default), and log-transforms the result.
+Normalized values are stored in pbmc[["RNA"]]@data.*
+</font>
+</div>
+
+## Identification of highly variable features (feature selection)
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*We next calculate a subset of features that exhibit high cell-to-cell
+variation in the dataset (i.e, they are highly expressed in some cells,
+and lowly expressed in others). Focusing on these genes in downstream
+analysis helps to highlight biological signal in single-cell datasets.*
+
+*The procedure in Seurat is described in detail here, and improves on
+previous versions by directly modeling the mean-variance relationship
+inherent in single-cell data, and is implemented in the
+FindVariableFeatures() function. By default, we return 2,000 features
+per dataset. These will be used in downstream analysis, like PCA.*
+</font>
+</div>
+
+```{r Feature Selection Plots, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/QC_Plots","/Feature_Selection.png",sep=""))
+```
+
+<hr class="solid">
+
+## Scaling the data
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Next, we apply a linear transformation ('scaling') that is a standard
+pre-processing step prior to dimensional reduction techniques like PCA.
+The ScaleData() function:*
+
+-   *Shifts the expression of each gene, so that the mean expression
+    across cells is 0*
+-   *Scales the expression of each gene, so that the variance across
+    cells is 1*
+-   *This step gives equal weight in downstream analyses, so that
+    highly-expressed genes do not dominate*
+-   *The results of this are stored in pbmc[["RNA"]]@scale.data*
+</font>
+</div>
+
+------------------------------------------------------------------------
+
+# Linear dimensional reduction
+
+At the core of scRNAseq analysis is the process of dimensional reduction. In traditional large data analysis we use principal components to define axes of variation within a dataset and then visualize the data by plotting it within a space defined by the most variable PCs. This is insufficent for single cell RNAseq as the number of axes of variation will be in the tens of thousands. As such following the calculation of principle components, we must perform dimmensional reduction to scale the data to a visualizabile state.
+
+We begin by performing traditional PCA.
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Next we perform PCA on the scaled data. By default, only the previously
+determined variable features are used as input, but can be defined using
+features argument if you wish to choose a different subset.*
+</font>
+</div>
+
+```{r Dimmensional Reduction Plots 1, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/PCA_Plot.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/PC1+PC2_loadings.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/Dim_Heatmap.png",sep=""))
+```
+
+In addition to the PCA plot itself, we can also define the genes that most contribute to the variation in the higher principle components. We do this first in the loadings plot, to easily discerne the genes that are defining the PCA plot itself, and second through the heatmaps which allow us to look at more components in a denser format. 
+
+With the principle components defined we can also take a look at the distribution of the cells from each sample within principle component space. 
+
+```{r Dimmensional Reduction Plots 2, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/seq_plotting.png",sep=""))
+```
+
+#### Important Note:
+
+If the biological replicates had been divided across sequencing samples, this step would allow us to check for batch effects between the samples. However because the biological replicates are grouped together we cannot make this check, as any potential batch effects would be subsumed into the differences defined by the biological condition. At this stage we have already corrected as much as possible for these effects, but because of this experimental design we cannot confirm that they have been removed. 
+
+# Determine the 'dimensionality' of the dataset
+
+With the principle components now defined, we can choose how many to include in the final dimmensional reduction. There are multiple ways to do this, but all of them serve to score the components based on their impact on the data set. The upper Jack Straw Score Plot does this statistically by calculating a p-value for the signifigance of each component. The Elbow Plot does this graphically based upon the Standard Deviation. In either case we can use these plots to judge how many components to carry forward. 
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*To overcome the extensive technical noise in any single feature for
+scRNA-seq data, Seurat clusters cells based on their PCA scores, with
+each PC essentially representing a 'metafeature' that combines
+information across a correlated feature set. The top principal
+components therefore represent a robust compression of the dataset.
+However, how many components should we choose to include? 10? 20? 100?*
+
+*In Macosko et al, they implemented a resampling test inspired by the
+JackStraw procedure. We randomly permute a subset of the data (1% by
+default) and rerun PCA, constructing a 'null distribution' of feature
+scores, and repeat this procedure. We identify 'significant' PCs as
+those who have a strong enrichment of low p-value features.*
+</font>
+</div>
+
+```{r Dimmensionallity plots, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/JackStraw.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/Dim_scaling","/ElbowPlot.png",sep=""))
+```
+
+Based on the above plots, I chose to proceed with 35 dimmensions for further analysis.
+
+<hr class="solid">
+
+# Cluster the cells
+
+With the dimmensionallity of the dataset determined we can cluster the cells and use a non-linear dimensional reduction (in this case UMAP) to define a space by which the cell clusters can be plotted and investifated. 
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Seurat v3 applies a graph-based clustering approach, building upon
+initial strategies in (Macosko et al). Importantly, the distance metric
+which drives the clustering analysis (based on previously identified
+PCs) remains the same. However, our approach to partitioning the
+cellular distance matrix into clusters has dramatically improved. Our
+approach was heavily inspired by recent manuscripts which applied
+graph-based clustering approaches to scRNA-seq data [SNN-Cliq, Xu and
+Su, Bioinformatics, 2015] and CyTOF data [PhenoGraph, Levine et al.,
+Cell, 2015]. Briefly, these methods embed cells in a graph structure -
+for example a K-nearest neighbor (KNN) graph, with edges drawn between
+cells with similar feature expression patterns, and then attempt to
+partition this graph into highly interconnected 'quasi-cliques' or
+'communities'.*
+
+*As in PhenoGraph, we first construct a KNN graph based on the euclidean
+distance in PCA space, and refine the edge weights between any two cells
+based on the shared overlap in their local neighborhoods (Jaccard
+similarity). This step is performed using the FindNeighbors() function,
+and takes as input the previously defined dimensionality of the dataset
+(first 10 PCs).*
+
+*To cluster the cells, we next apply modularity optimization techniques
+such as the Louvain algorithm (default) or SLM [SLM, Blondel et al.,
+Journal of Statistical Mechanics], to iteratively group cells together,
+with the goal of optimizing the standard modularity function. The
+FindClusters() function implements this procedure, and contains a
+resolution parameter that sets the 'granularity' of the downstream
+clustering, with increased values leading to a greater number of
+clusters. We find that setting this parameter between 0.4-1.2 typically
+returns good results for single-cell datasets of around 3K cells.
+Optimal resolution often increases for larger datasets. The clusters can
+be found using the Idents() function.*
+</font>
+</div>
+
+## Run non-linear dimensional reduction (UMAP/tSNE)
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Seurat offers several non-linear dimensional reduction techniques, such
+as tSNE and UMAP, to visualize and explore these datasets. The goal of
+these algorithms is to learn the underlying manifold of the data in
+order to place similar cells together in low-dimensional space. Cells
+within the graph-based clusters determined above should co-localize on
+these dimension reduction plots. As input to the UMAP and tSNE, we
+suggest using the same PCs as input to the clustering analysis.*
+</font>
+</div>
+
+```{r UMAP Plot, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/UMAP","/UMAP_Unlabeled.png",sep=""))
+```
+
+<hr class="solid">
+
+<hr class="solid">
+
+# Finding differentially expressed features (cluster biomarkers)
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*Seurat can help you find markers that define clusters via differential
+expression. By default, it identifies positive and negative markers of a
+single cluster (specified in ident.1), compared to all other cells.
+FindAllMarkers() automates this process for all clusters, but you can
+also test groups of clusters vs. each other, or against all cells.*
+
+*The min.pct argument requires a feature to be detected at a minimum
+percentage in either of the two groups of cells, and the thresh.test
+argument requires a feature to be differentially expressed (on average)
+by some amount between the two groups. You can set both of these to 0,
+but with a dramatic increase in time - since this will test a large
+number of features that are unlikely to be highly discriminatory. As
+another option to speed up these computations, max.cells.per.ident can
+be set. This will downsample each identity class to have no more cells
+than whatever this is set to. While there is generally going to be a
+loss in power, the speed increases can be significant and the most
+highly differentially expressed features will likely still rise to the
+top.*
+</font>
+</div>
+
+```{r Find Biomarkers Plots, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/BioMarkers","/DO_HeatMap.png",sep=""))
+slickR(obj = list.files(paste(RES_DIR,"/BioMarkers/ClusterMarkers/",sep = ""), full.names = TRUE) ,height = 200, width = "95%")
+```
+
+# Cell Identification using ScType
+
+Article: [<https://doi.org/10.1038/s41467-022-28803-w>]
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+*ScType a computational method for automated selection of marker genes
+based merely on scRNA-seq data. The open-source portal
+(<http://sctype.app>) provides an interactive web-implementation of the
+method.*
+</font>
+</div>
+
+```{r ScType Plots, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/ClusterIDs/ClusterMakeUp.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/ClusterIDs/ClusterScores.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/ClusterIDs/ClusterIDs.png",sep=""))
+```
+
+# Sample Distribution and Analysis
+
+Now that the cell clusters have been identified the next step is to look at the make up of each cluster and see if any of the cell types are skewed towards a particular sample or condition. The UMAPS below highlight each sample in particular, while the bar plot shows the cellular frequency of each sample in each cluster. 
+
+Of particular note:
+
+-   The Naive B cell and Plasma cell clusters are almost entirely derived from BM Only cells
+-   The Unknown cluster is primarily derived from aGVHD and Steroid Resistant cells
+-   The NK cell cluster is largely derived from Steroid Responsive cells
+-   Both CD8+ clusters strongly favor thhe aGVHD and Steroid Responsive conditions
+
+```{r Cluster Sample Composition Plots, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/SampMatch/SampleUMAP.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/SampMatch/FrequencyPlot.png",sep=""))
+```
+
+# Cluster Deep Analysis {.tabset}
+
+In order to best determine what cell types are going to be worth diving further into, the next step I took was to individually recluster each cell type pseudo-cluster in isolation from one another. Then to check for isolation of treatment conditions within the cell types. If the sub clusters organize primarily by treatment condition it suggests that this is the primary defining comparison left within the cluster. This indicates that there is not a further sub cell type to parse out from the cluster, but that we can instead move onto differential expression testing and gene set enrichment analysis. This method also allows us to identify which cell type pseudo-clusters lack either the appropriate cell counts, or internal variance, for deeper analysis. 
+
+Based on this criteria the following cell pseudo-clusters are worth performing DE and GSEA on:
+
+-   CD8+ NKT-Like Cells
+-   Effector CD4+ T Cells
+-   Memory CD8+ T Cells
+
+<hr class="solid">
+
+``` {r DeepCluster Plot Tabs,dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T, dpi = 300, fig.width = 12, results="asis"}
+tabs = list.dirs(paste(RES_DIR,"/DeepClustAnalysis/",sep=""),recursive = F,full.names = F)
+
+for (l in 1:length(tabs)) {
+  cat('\n\n##', tabs[l], ' \n\n')
+    if (file.exists(paste(RES_DIR,"/DeepClustAnalysis/",tabs[l],"/",tabs[l],"_UMAPs.png",sep=""))==TRUE) {
+      cat("![](",RES_DIR,"/DeepClustAnalysis/",tabs[l],"/",tabs[l],"_UMAPs.png",")",sep="")
+    } 
+    if (file.exists(paste(RES_DIR,"/DeepClustAnalysis/",tabs[l],"/",tabs[l],"_By Sample_UMAPs.png",sep=""))==TRUE) {
+          cat("![](",RES_DIR,"/DeepClustAnalysis/",tabs[l],"/",tabs[l],"_By Sample_UMAPs.png",")",sep="")
+    } 
+      if (dir.exists(paste(RES_DIR,"/DeepClustAnalysis/",tabs[l],"/SubCluster_Markers/",sep = ""))==TRUE) {
+        imgs = list.files(paste(RES_DIR,"/DeepClustAnalysis/",tabs[l],"/SubCluster_Markers/",sep = ""),full.names = T)
+        names = list.files(paste(RES_DIR,"/DeepClustAnalysis/",tabs[l],"/SubCluster_Markers/",sep = ""),full.names = F)
+        cat('\n\n###','Differentially Expresseed Cluster Markers {.tabset}','\n\n')
+        for (q in 1:length(imgs)) {
+          cat('\n\n####',names[q],'\n\n')
+          cat("![](",imgs[q],")",sep="")
+        }
+        cat('\n\n###  {.unnumbered} \n\n')
+    }
+  cat('\n\n##  {.unnumbered} \n\n')
+}
+
+```
+
+# {-}
+
+<hr class="solid">
+
+# Differential Expression and GSEA by Cell Type Pseudo-Cluster using iDEA{.tabset}
+
+Article: [<https://www.nature.com/articles/s41467-020-15298-6>]
+
+<div class="boxy boxy-warning boxy-clipboard-list">
+<font size="0.75">
+We developed a new computational method, iDEA, that enables powerful DE and GSE analysis for scRNAseq studies through integrative statistical modeling. Our method builds upon a hierarchical Bayesian model for joint modeling of DE and GSE analyses. It uses only summary statistics as input, allowing for effective data modeling through complementing and pairing with various existing DE methods. It relies on an efficient expectation-maximization algorithm with internal Markov Chain Monte Carlo steps for scalable inference. By integrating DE and GSE analyses, iDEA can improve the power and consistency of DE analysis and the accuracy of GSE analysis over common existing approaches. iDEA is implemented as an R package with source code freely available at: www.xzlab.org/software.html.
+</font>
+</div>
+
+## CD8+ NKT-Like Cells
+
+```{r CD8+ NKT-Like Cells Differential Expression, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/CD8+_NKT-like_cells/DE/Clustering_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/CD8+_NKT-like_cells/DE/TopGene_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/CD8+_NKT-like_cells/DE/GSEA_Bubble_BMOnly.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/CD8+_NKT-like_cells/DE/GSEA_Bubble_aGVHD.png",sep=""))
+```
+
+## Effector CD4+ T Cells
+
+```{r Effector CD4+ T Cells Differential Expression, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Effector_CD4+_T_cells/DE/Clustering_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Effector_CD4+_T_cells/DE/TopGene_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Effector_CD4+_T_cells/DE/GSEA_Bubble_BMOnly.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Effector_CD4+_T_cells/DE/GSEA_Bubble_aGVHD.png",sep=""))
+```
+
+
+## Memory CD8+ T Cells
+
+```{r Memory CD8+ T Cells Differential Expression, dev.args = list(bg = 'transparent') , echo=F, warning=F, comment=F, message = F, include=T, eval=T}
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Memory_CD8+_T_cells/DE/Clustering_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Memory_CD8+_T_cells/DE/TopGene_Multi.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Memory_CD8+_T_cells/DE/GSEA_Bubble_BMOnly.png",sep=""))
+knitr::include_graphics(paste(RES_DIR,"/DeepClustAnalysis/Memory_CD8+_T_cells/DE/GSEA_Bubble_aGVHD.png",sep=""))
+```
+
+# {-}
+
+# Session Info
+
+```{r Appendix,echo=FALSE,class.source = 'fold-hide'}
+sessionInfo()
+getwd()
+```
